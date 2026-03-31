@@ -1,0 +1,10 @@
+{
+  "max_concurrent": 3,
+  "agent_timeout_minutes": 30,
+  "projects_root": "~/projects",
+  "agents_root": "~/half-bakery-framework/agents",
+  "github_repo": "your-username/your-repo",
+  "github_project_number": 1,
+  "state_dir": "~/.half-bakery",
+  "claude_permission_mode": "acceptEdits"
+}
