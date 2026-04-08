@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.1] — 2026-04-08
+
+### Summary
+
+Documentation patch — remove three deprecated agent personas (marketing-expert, 3d-designer, ceo) from the public framework repo. These were removed from the active dispatch roster in the private working repo but were not cleaned up when v1.1.0 was published.
+
+---
+
+### 📝 Documentation Fixes
+
+#### Stale agent references removed
+The following agents were removed from the active roster (they were opinionated personas tied to a specific user's workflow, not general-purpose framework components). All references have been purged:
+
+- **marketing-expert** — `agents/marketing-expert/` directory removed; Marketing column and keywords removed from `column-routes.json`; references removed from README
+- **3d-designer** — `agents/3d-designer/` directory removed; 3D Design column and keywords removed from `column-routes.json`; references removed from README
+- **ceo** — `agents/ceo/` directory removed; references removed from README (this agent was manual-only with no column)
+
+#### Pipeline diagram corrected
+README pipeline diagram now correctly shows:
+```
+Engineering ──> QA ──> Docs ──> Done     (default pipeline)
+Research ──> Ready                        (human reviews, decides next)
+Architecture ──> Ready                    (human reviews, decides next)
+```
+Previously incorrectly showed Research/Architecture routing to "Review" instead of "Ready".
+
+#### Agent count updated
+README now correctly states "Five specialists" (founding-engineer, qa, documentarian, research-analyst, architect) rather than "Eight specialists."
+
+---
+
+**Semver rationale:** PATCH — documentation-only correction. No API, behavior, or configuration changes. Removing the agent directories does not break existing deployments (users who had custom agents in these directories would need to keep their local copies, but the framework itself has no dependency on them).
+
+
 ## [1.1.0] — 2026-04-08
 
 ### Summary
