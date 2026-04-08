@@ -85,8 +85,6 @@ Create a [GitHub Projects](https://docs.github.com/en/issues/planning-and-tracki
 | **Engineering** | Founding Engineer builds it. |
 | **QA** | QA agent reviews and tests. |
 | **Docs** | Documentarian updates docs. |
-| **Marketing** | Marketing Expert writes content. |
-| **3D Design** | 3D Designer creates assets. |
 | **Review** | Needs human attention. Dispatcher ignores. |
 | **Done** | Complete. Issue gets closed. |
 
@@ -150,9 +148,7 @@ When an issue lands in the **Ready** column, the dispatcher scans the title and 
 |-------------------|-----------|
 | bug, fix, error, broken, crash | Engineering |
 | research, investigate, explore, analyze | Research |
-| blog, post, announce, social | Marketing |
 | design, architecture, RFC | Architecture |
-| 3D, model, mesh, render, blender | 3D Design |
 | *(anything else)* | Engineering |
 
 You can always override by dragging the issue to any column manually.
@@ -161,15 +157,13 @@ After each agent finishes, the dispatcher merges the work and advances to the ne
 
 ```
 Engineering ──> QA ──> Docs ──> Done     (default pipeline)
-Research ──> Review                       (human reviews, decides next)
-Architecture ──> Review                   (human reviews, decides next)
-Marketing ──> Done
-3D Design ──> QA ──> Done
+Research ──> Ready                        (human reviews, decides next)
+Architecture ──> Ready                    (human reviews, decides next)
 ```
 
 ## The Agents
 
-Eight specialists, each with a persona and clear boundaries:
+Five specialists, each with a persona and clear boundaries:
 
 | Agent | What it does | Vibe |
 |-------|-------------|------|
@@ -178,9 +172,6 @@ Eight specialists, each with a persona and clear boundaries:
 | **documentarian** | Maintains project history and docs | "If it's not documented, it didn't happen" |
 | **research-analyst** | Investigates questions, produces structured analysis | "Here are the facts and my recommendation" |
 | **architect** | Designs systems, writes RFCs | "Let's think about this before we build it" |
-| **marketing-expert** | Creates blog posts, social content, announcements | "Ship the narrative" |
-| **3d-designer** | Creates and prepares 3D-printable models | "Will it print?" |
-| **ceo** | Strategic triage and decision-making (manual only) | "What do we stop?" |
 
 Each agent gets:
 - A persona file (`AGENTS.md`) — who they are and how they think
@@ -311,7 +302,9 @@ half-bakery-framework/
       AGENTS.md              Instructions and boundaries
       HEARTBEAT.md           Execution checklist
     qa/ ...
-    ceo/ ...
+    documentarian/ ...
+    research-analyst/ ...
+    architect/ ...
   config/
     column-routes.json       Pipeline routing rules
     dispatcher.json          Runtime configuration
