@@ -1,7 +1,7 @@
 {
   "columns": {
-    "Research":     { "agent": "research-analyst",  "next": "Ready" },
-    "Architecture": { "agent": "architect",         "next": "Ready" },
+    "Research":     { "agent": "research-analyst",  "next": "Review" },
+    "Architecture": { "agent": "architect",         "next": "Review" },
     "Engineering":  { "agent": "founding-engineer",  "next": "QA" },
     "QA":           { "agent": "qa",                "next": "Docs" },
     "Docs":         { "agent": "documentarian",     "next": "Done" },

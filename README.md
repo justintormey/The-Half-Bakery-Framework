@@ -32,7 +32,7 @@ No orchestration framework. No token-burning coordination layer. Just a cron job
 
 Most multi-agent systems burn tokens on coordination — agents polling queues, reading board state, deciding what to do next. That's expensive busywork.
 
-Half Bakery takes a different approach: **deterministic dispatch, stateless agents.** A ~700-line Python script handles all the boring stuff (polling, routing, state tracking, merges). Agents receive exactly two things: who they are and what to do. No wasted tokens.
+Half Bakery takes a different approach: **deterministic dispatch, stateless agents.** A ~1300-line Python script handles all the boring stuff (polling, routing, state tracking, merges). Agents receive exactly two things: who they are and what to do. No wasted tokens.
 
 The whole thing runs on a Claude Max subscription. No API keys, no per-token billing, no infrastructure beyond your laptop and a launchd timer.
 
@@ -59,15 +59,18 @@ Edit `config/dispatcher.json`:
 ```json
 {
   "max_concurrent": 3,
-  "agent_timeout_minutes": 30,
+  "agent_timeout_minutes": 45,
   "projects_root": "~/projects",
   "agents_root": "~/half-bakery-framework/agents",
   "github_repo": "your-username/your-repo",
   "github_project_number": 1,
   "state_dir": "~/.half-bakery",
-  "claude_permission_mode": "acceptEdits"
+  "claude_permission_mode": "bypassPermissions",
+  "spanning_projects": []
 }
 ```
+
+> **Note:** Use `bypassPermissions` — agents are headless (`--print` mode) and cannot respond to permission prompts. Safety comes from git worktree isolation and timeouts, not the sandbox.
 
 ### 2. Set up your GitHub Projects board
 
@@ -87,31 +90,57 @@ Create a [GitHub Projects](https://docs.github.com/en/issues/planning-and-tracki
 | **Review** | Needs human attention. Dispatcher ignores. |
 | **Done** | Complete. Issue gets closed. |
 
-Add a custom text field called **Target Project** — this tells the dispatcher which repo to work in.
+The dispatcher **auto-derives the target project** from the issue's repository name — no custom fields needed.
 
 ### 3. Test it
 
 ```bash
-# Run the dispatcher manually first
+# Validate your setup (checks claude binary, config paths, gh CLI)
+python3 scripts/dispatcher.py --dry-run
+
+# Run the dispatcher manually
 python3 scripts/dispatcher.py
 
-# Create a test issue, set Target Project, drag to Ready
-# Run the dispatcher again and watch it work
+# Create a test issue and drag to Ready, then run again
 ```
 
-### 4. Install the timer (optional)
+### 4. Install the timer
 
 ```bash
-# Edit the plist with your paths first
-vim launchd/com.halfbakery.dispatcher.plist
+# Copy and edit the plist — update paths and environment variables (see below)
+cp launchd/com.halfbakery.dispatcher.plist ~/Library/LaunchAgents/
+vim ~/Library/LaunchAgents/com.halfbakery.dispatcher.plist
 
 # Install
-cp launchd/com.halfbakery.dispatcher.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.halfbakery.dispatcher.plist
 launchctl start com.halfbakery.dispatcher
 
 # Now it runs every 5 minutes automatically
 ```
+
+### launchd Plist Requirements
+
+The plist **must** include these environment variables and settings. Without them, agents will crash silently:
+
+```xml
+<key>EnvironmentVariables</key>
+<dict>
+    <key>PATH</key>
+    <!-- Must include ~/.local/bin where the claude binary lives -->
+    <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/YOU</string>
+    <key>USER</key>
+    <!-- Required for Claude Max OAuth auth — without this, agents get "Not logged in" -->
+    <string>YOUR_USERNAME</string>
+</dict>
+<!-- Required: launchd kills all child processes on parent exit by default.
+     Since the dispatcher spawns agents and then exits, this MUST be true. -->
+<key>AbandonProcessGroup</key>
+<true/>
+```
+
+See `launchd/com.halfbakery.dispatcher.plist` for the full template.
 
 ## How the Pipeline Works
 
@@ -132,10 +161,10 @@ After each agent finishes, the dispatcher merges the work and advances to the ne
 
 ```
 Engineering ──> QA ──> Docs ──> Done     (default pipeline)
-Research ──> Ready                        (human decides next)
-Architecture ──> Ready                    (human decides next)
+Research ──> Review                       (human reviews, decides next)
+Architecture ──> Review                   (human reviews, decides next)
 Marketing ──> Done
-3D Design ──> QA ──> Docs ──> Done
+3D Design ──> QA ──> Done
 ```
 
 ## The Agents
@@ -167,19 +196,54 @@ Each agent does NOT get:
 
 Agents are just markdown files. Edit `agents/{type}/AGENTS.md` to change behavior, add domain knowledge, or adjust boundaries. Add new agents by creating a new directory and updating `config/column-routes.json`.
 
+## Spanning Projects
+
+If an agent needs to work across multiple repos (e.g., the dispatcher itself needs access to all sibling projects), add the project name to `spanning_projects` in `dispatcher.json`:
+
+```json
+"spanning_projects": ["my-meta-project"]
+```
+
+Agents working on spanning projects receive `--add-dir` flags for all git repos under `projects_root`, giving them read/write access to the entire project portfolio.
+
+## Epic / Sub-Issue Support
+
+The dispatcher natively handles GitHub's sub-issues feature. Epics (issues with sub-issues) are skipped during dispatch — they're containers. Sub-issues dispatch normally with enriched context:
+
+- **Parent Epic description** — the agent knows the bigger goal
+- **Sibling awareness** — the agent sees other sub-issues (their status, not their work)
+- **Auto-close** — when all sub-issues complete, the Epic is closed automatically
+
+No configuration needed — detection is structural (issue has sub-issues = Epic).
+
+## Dashboard
+
+A local browser dashboard for monitoring the dispatcher. Zero external dependencies — Python stdlib HTTP server + vanilla HTML/CSS/JS.
+
+```bash
+# Launch the dashboard (opens browser automatically)
+./dashboard/run
+
+# Or run on a custom port
+python3 dashboard/serve.py 8888
+```
+
+Shows running agents, activity feed, project inventory, and pipeline visualization.
+
 ## Configuration
 
 ### `config/dispatcher.json`
 
-| Key | What it does | Default |
+| Key | What it does | Recommended |
 |-----|-------------|---------|
 | `max_concurrent` | Max agents running at once | `3` |
-| `agent_timeout_minutes` | Kill agents after this long | `30` |
+| `agent_timeout_minutes` | Kill agents after this long | `45` |
 | `projects_root` | Parent directory of your project repos | `~/projects` |
-| `agents_root` | Path to this repo's `agents/` directory | (set during setup) |
-| `github_repo` | Which repo to poll for issues | (set during setup) |
+| `agents_root` | Path to this repo's `agents/` directory | *(set during setup)* |
+| `github_repo` | Which repo to poll for issues | *(set during setup)* |
 | `github_project_number` | Which Projects board to use | `1` |
-| `claude_permission_mode` | Permission mode for Claude sessions | `acceptEdits` |
+| `claude_permission_mode` | Permission mode for Claude sessions | `bypassPermissions` |
+| `spanning_projects` | Repos whose agents get cross-repo access | `[]` |
 
 ### `config/column-routes.json`
 
@@ -194,27 +258,39 @@ launchctl start com.halfbakery.dispatcher
 # Pause the service
 launchctl stop com.halfbakery.dispatcher
 
+# Unload entirely
+launchctl unload ~/Library/LaunchAgents/com.halfbakery.dispatcher.plist
+
+# Check if running
+launchctl list | grep halfbakery
+
 # Watch what's happening
 tail -f ~/.half-bakery/logs/dispatcher.log
 
 # See running agents
 cat ~/.half-bakery/state.json
-
-# Uninstall
-launchctl unload ~/Library/LaunchAgents/com.halfbakery.dispatcher.plist
 ```
 
 ## What Happens When Things Go Wrong
 
 | Situation | What the dispatcher does |
 |-----------|------------------------|
-| Agent times out (>30 min) | Kills the process, moves issue to Review, posts a comment |
-| Agent crashes | Detects dead PID, moves to Review, preserves output for debugging |
-| Agent is blocked | Detects `BLOCKED:` in output, moves to Review, posts the blocker |
+| Agent times out | Kills the process, moves issue to Review, posts a comment with elapsed time |
+| Agent crashes | Detects dead PID, moves to Review, posts last output for debugging |
+| Agent is blocked | Detects `##BLOCKED##` in output, moves to Review, posts the blocker reason |
 | Merge conflict | Moves to Review, preserves the agent's branch for manual resolution |
 | Dispatcher itself crashes | Lock file prevents zombie runs. Agents keep running independently. Next cycle cleans up. |
+| Orphaned worktrees/branches | Cleaned up automatically at the start of each dispatcher cycle |
 
 Everything that needs human attention ends up in the **Review** column with a comment explaining what happened.
+
+## Blocker Protocol
+
+If an agent can't complete its work, it outputs a line starting with `##BLOCKED##` followed by the reason. The dispatcher detects this, posts the blocker as an issue comment, and moves the issue to **Review** for human attention.
+
+```
+##BLOCKED## Cannot proceed — AWS credentials not configured in environment
+```
 
 ## Cost Model
 
@@ -223,7 +299,7 @@ This runs entirely on a **Claude Max subscription** ($100-200/month). No API key
 Things to know:
 - 3 concurrent agents will eat through your rate-limit window faster than single sessions
 - If you're hitting rate limits, drop `max_concurrent` to 2 or 1
-- The 30-minute timeout is your budget safety net — adjust as needed
+- The 45-minute timeout is your budget safety net — adjust as needed
 - Research and Architecture agents tend to be cheaper (shorter sessions) than Engineering
 
 ## File Layout
@@ -240,12 +316,17 @@ half-bakery-framework/
     column-routes.json       Pipeline routing rules
     dispatcher.json          Runtime configuration
   scripts/
-    dispatcher.py            The dispatcher (~700 lines of Python)
+    dispatcher.py            The dispatcher (~1300 lines of Python)
+  dashboard/
+    serve.py                 Python stdlib HTTP server
+    index.html               Single-page monitoring UI
+    run                      Launcher script (opens browser)
   launchd/
     com.halfbakery.dispatcher.plist
 
 ~/.half-bakery/              Runtime state (created automatically)
   state.json                 Running agents + PIDs
+  dispatcher.lock            Single-instance lock
   worktrees/                 One git worktree per active agent
   output/                    Agent stdout logs
   logs/                      Dispatcher logs
@@ -254,13 +335,15 @@ half-bakery-framework/
 
 ## Design Decisions
 
-**Why not use an existing orchestrator?** We evaluated 12+ tools (March 2026). Every multi-agent framework we found either burns tokens on coordination (the thing we're trying to avoid) or requires infrastructure beyond a laptop. The closest match was Claude Code Agent Farm, but it generates work internally rather than reading from an external ticket source.
+**Why not use an existing orchestrator?** We evaluated 12+ tools. Every multi-agent framework we found either burns tokens on coordination (the thing we're trying to avoid) or requires infrastructure beyond a laptop. The closest match was Claude Code Agent Farm, but it generates work internally rather than reading from an external ticket source.
 
 **Why git worktrees?** Universal consensus across the multi-agent ecosystem. Every serious orchestrator isolates agents this way. It prevents concurrent agents from stepping on each other's files while keeping them in the same git repo.
 
 **Why launchd?** It's already on your Mac. No Docker, no Kubernetes, no cloud functions. The dispatcher is stateless and crash-safe — if it dies, the next 5-minute cycle picks up where it left off.
 
 **Why GitHub Issues?** You probably already use them. The issue body IS the task specification. Comments become the communication log. The Projects board IS the kanban. No new tools to learn.
+
+**Why `bypassPermissions`?** Agents run in `--print` (headless) mode and cannot respond to interactive prompts. Any permission prompt causes a hang or exit. Safety is provided by git worktree isolation (agents can't touch main branch) and the timeout kill switch.
 
 ## Contributing
 

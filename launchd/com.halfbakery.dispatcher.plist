@@ -7,21 +7,35 @@
     <string>com.halfbakery.dispatcher</string>
     <key>ProgramArguments</key>
     <array>
+        <!-- UPDATE: set to your python3 path (which python3) -->
         <string>/usr/bin/python3</string>
         <!-- UPDATE: path to your clone of half-bakery-framework -->
         <string>/path/to/half-bakery-framework/scripts/dispatcher.py</string>
     </array>
     <key>StartInterval</key>
     <integer>300</integer>
+    <!-- UPDATE: set to paths under your ~/.half-bakery/logs/ -->
     <key>StandardOutPath</key>
-    <string>/tmp/half-bakery-dispatcher-stdout.log</string>
+    <string>/Users/YOU/.half-bakery/logs/launchd-stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/half-bakery-dispatcher-stderr.log</string>
+    <string>/Users/YOU/.half-bakery/logs/launchd-stderr.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <!-- Must include ~/.local/bin where the claude binary lives -->
+        <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <!-- UPDATE: your home directory -->
+        <string>/Users/YOU</string>
+        <key>USER</key>
+        <!-- Required for Claude Max OAuth auth — without this, agents get "Not logged in" -->
+        <!-- UPDATE: your macOS username -->
+        <string>YOUR_USERNAME</string>
     </dict>
+    <!-- Required: launchd kills all child processes on parent exit by default.
+         Since the dispatcher spawns agents and then exits, this MUST be true. -->
+    <key>AbandonProcessGroup</key>
+    <true/>
     <key>RunAtLoad</key>
     <false/>
 </dict>

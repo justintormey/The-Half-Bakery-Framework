@@ -1,0 +1,1155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Half Bakery</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🍞</text></svg>">
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card-bg: #161b22;
+      --card-border: #30363d;
+      --text-primary: #e6edf3;
+      --text-secondary: #b1bac4;
+      --text-muted: #8b949e;
+      --accent: #f0883e;
+      --link: #58a6ff;
+      --green: #3fb950;
+      --yellow: #d29922;
+      --red: #f85149;
+      --grey: #8b949e;
+      --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    a { color: var(--link); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    main {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 0 16px 16px;
+    }
+
+    /* Header */
+    header {
+      background: var(--card-bg);
+      border-bottom: 1px solid var(--card-border);
+      padding: 12px 16px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .header-inner {
+      max-width: 1200px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .header-title {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--accent);
+    }
+
+    .health-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+      flex-shrink: 0;
+    }
+
+    .health-green { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .health-yellow { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
+    .health-red { background: var(--red); box-shadow: 0 0 6px var(--red); }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .header-right .sep { color: var(--card-border); }
+
+    /* Sections */
+    section {
+      margin-top: 24px;
+    }
+
+    .section-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text-primary);
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .section-count {
+      font-size: 12px;
+      color: var(--text-muted);
+      font-weight: 400;
+    }
+
+    /* Card grid */
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      gap: 12px;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 14px;
+    }
+
+    /* Agent cards */
+    .agent-card {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .agent-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .agent-issue-num {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--link);
+    }
+
+    .agent-issue-num a { color: inherit; }
+
+    .agent-detail {
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .agent-detail .label {
+      color: var(--text-muted);
+    }
+
+    .elapsed {
+      font-family: var(--font-mono);
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    /* Badges */
+    .badge {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 12px;
+      white-space: nowrap;
+    }
+
+    .badge-founding-engineer { background: #1f6feb33; color: #58a6ff; }
+    .badge-qa { background: #23883033; color: #3fb950; }
+    .badge-documentarian { background: #6e40c933; color: #bc8cff; }
+    .badge-research-analyst { background: #0e434533; color: #39d2c0; }
+    .badge-architect { background: #5c320033; color: #f0883e; }
+    .badge-marketing-expert { background: #5c003333; color: #f778ba; }
+    .badge-3d-designer { background: #00445533; color: #56d4dd; }
+
+    /* No agents state */
+    .no-agents {
+      text-align: center;
+      padding: 32px 16px;
+      color: var(--text-secondary);
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+    }
+
+    .no-agents .big-icon {
+      font-size: 32px;
+      margin-bottom: 8px;
+    }
+
+    /* Activity cards */
+    .activity-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .activity-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-left: 3px solid var(--grey);
+      border-radius: 6px;
+      padding: 10px 14px;
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+    }
+
+    .activity-card.border-green { border-left-color: var(--green); }
+    .activity-card.border-blue { border-left-color: var(--link); }
+    .activity-card.border-red { border-left-color: var(--red); }
+    .activity-card.border-yellow { border-left-color: var(--yellow); }
+    .activity-card.border-grey { border-left-color: var(--grey); }
+
+    .activity-icon {
+      font-size: 16px;
+      flex-shrink: 0;
+      line-height: 1.4;
+    }
+
+    .activity-body {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .activity-headline {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .activity-detail {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-top: 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .activity-time {
+      font-size: 11px;
+      color: var(--text-muted);
+      white-space: nowrap;
+      flex-shrink: 0;
+      line-height: 1.7;
+    }
+
+    /* Tabs */
+    .tab-bar {
+      display: flex;
+      gap: 0;
+      border-bottom: 1px solid var(--card-border);
+      margin-bottom: 16px;
+    }
+
+    .tab-btn {
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: var(--text-muted);
+      font-size: 14px;
+      font-weight: 600;
+      font-family: var(--font-sans);
+      padding: 10px 20px;
+      cursor: pointer;
+      transition: color 0.15s, border-color 0.15s;
+    }
+
+    .tab-btn:hover {
+      color: var(--text-secondary);
+    }
+
+    .tab-btn.active {
+      color: var(--text-primary);
+      border-bottom-color: var(--accent);
+    }
+
+    .tab-panel {
+      display: none;
+    }
+
+    .tab-panel.active {
+      display: block;
+    }
+
+    /* Projects section */
+    .filter-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+
+    .filter-btn {
+      background: transparent;
+      border: 1px solid var(--card-border);
+      color: var(--text-secondary);
+      font-size: 12px;
+      padding: 4px 12px;
+      border-radius: 16px;
+      cursor: pointer;
+      font-family: var(--font-sans);
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+    }
+
+    .filter-btn:hover {
+      border-color: var(--text-muted);
+      color: var(--text-primary);
+    }
+
+    .filter-btn.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+
+    .filter-btn .count {
+      font-size: 11px;
+      opacity: 0.7;
+      margin-left: 4px;
+    }
+
+    .search-input {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      color: var(--text-primary);
+      font-size: 13px;
+      padding: 5px 12px;
+      border-radius: 6px;
+      font-family: var(--font-sans);
+      width: 220px;
+      margin-left: auto;
+    }
+
+    .search-input::placeholder { color: var(--text-muted); }
+    .search-input:focus { outline: none; border-color: var(--accent); }
+
+    /* Project cards */
+    .project-card {
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+
+    .project-card:hover {
+      border-color: var(--text-muted);
+    }
+
+    .project-card.expanded {
+      border-color: var(--accent);
+      grid-column: 1 / -1;
+    }
+
+    .project-name {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+      margin-bottom: 4px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .project-name .emoji {
+      font-size: 16px;
+    }
+
+    .project-status {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-bottom: 6px;
+    }
+
+    .project-desc {
+      font-size: 13px;
+      color: var(--text-secondary);
+      margin-bottom: 8px;
+      line-height: 1.4;
+    }
+
+    .project-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .project-type-badge {
+      font-size: 11px;
+      color: var(--text-muted);
+      background: #30363d50;
+      padding: 1px 8px;
+      border-radius: 10px;
+    }
+
+    .project-github-indicator {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .project-cls-badge {
+      font-size: 10px;
+      font-weight: 600;
+      padding: 1px 7px;
+      border-radius: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+
+    .cls-public { background: #1f6feb33; color: #58a6ff; }
+    .cls-private { background: #30363d50; color: var(--text-muted); }
+    .cls-aws { background: #f0883e22; color: #f0883e; }
+    .cls-local { background: #30363d50; color: var(--text-muted); }
+
+    /* Expanded project details */
+    .project-expanded {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--card-border);
+    }
+
+    .project-expanded .field {
+      font-size: 13px;
+      color: var(--text-secondary);
+      margin-bottom: 4px;
+    }
+
+    .project-expanded .field .label {
+      color: var(--text-muted);
+    }
+
+    .project-expanded .field code {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      background: #30363d50;
+      padding: 1px 5px;
+      border-radius: 3px;
+    }
+
+    .project-expanded .extras {
+      font-size: 13px;
+      color: var(--text-secondary);
+      margin-top: 8px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }
+
+    .project-parse-error {
+      font-size: 12px;
+      color: var(--red);
+      font-style: italic;
+    }
+
+    /* Pipeline */
+    .pipeline-main {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+
+    .pipeline-node {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .pipeline-arrow {
+      font-size: 18px;
+      color: var(--text-muted);
+      margin: 0 4px;
+    }
+
+    .pipeline-node.node-ready { background: #30363d; color: var(--text-primary); }
+    .pipeline-node.node-engineering { background: #1f6feb33; color: #58a6ff; }
+    .pipeline-node.node-qa { background: #23883033; color: #3fb950; }
+    .pipeline-node.node-docs { background: #6e40c933; color: #bc8cff; }
+    .pipeline-node.node-done { background: #23883033; color: #3fb950; border: 1px solid #3fb95055; }
+    .pipeline-node.node-review { background: #d2992233; color: #d29922; border: 1px solid #d2992255; }
+
+    .pipeline-alt {
+      font-size: 13px;
+      color: var(--text-secondary);
+      line-height: 1.7;
+    }
+
+    .pipeline-alt .route-label {
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <header id="header"></header>
+  <main>
+    <section id="agents"></section>
+    <div class="tab-bar" id="tab-bar">
+      <button class="tab-btn active" data-tab="activity">Activity</button>
+      <button class="tab-btn" data-tab="projects">Projects</button>
+    </div>
+    <div id="tab-activity" class="tab-panel active">
+      <section id="activity"></section>
+      <section id="pipeline"></section>
+    </div>
+    <div id="tab-projects" class="tab-panel">
+      <section id="projects"></section>
+    </div>
+  </main>
+  <script>
+    /* ── Global state ── */
+    let config = null;
+    let state = null;
+    let projects = [];
+    let logEntries = [];
+    let activeFilter = 'all';
+    let searchTerm = '';
+    let expandedProjects = new Set();
+
+    /* ── Fetch helpers ── */
+    async function fetchJSON(url) {
+      try {
+        const r = await fetch(url + '?_t=' + Date.now());
+        if (!r.ok) return null;
+        return await r.json();
+      } catch { return null; }
+    }
+
+    async function fetchText(url) {
+      try {
+        const r = await fetch(url + (url.includes('?') ? '&' : '?') + '_t=' + Date.now());
+        if (!r.ok) return null;
+        return await r.text();
+      } catch { return null; }
+    }
+
+    /* ── Utility ── */
+    function esc(str) {
+      if (!str) return '';
+      return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function timeAgo(isoStr) {
+      if (!isoStr) return 'unknown';
+      const d = new Date(isoStr);
+      const secs = Math.floor((Date.now() - d) / 1000);
+      if (secs < 0) return '0s ago';
+      const m = Math.floor(secs / 60);
+      const s = secs % 60;
+      if (m > 0) return m + 'm ' + s.toString().padStart(2, '0') + 's ago';
+      return s + 's ago';
+    }
+
+    function nextPollStr(lastPollIso) {
+      if (!lastPollIso) return '~5m';
+      const last = new Date(lastPollIso);
+      const next = new Date(last.getTime() + 300 * 1000);
+      const secs = Math.floor((next - Date.now()) / 1000);
+      if (secs <= 0) return 'overdue';
+      const m = Math.floor(secs / 60);
+      const s = secs % 60;
+      return '~' + m + 'm ' + s.toString().padStart(2, '0') + 's';
+    }
+
+    function healthClass(lastPollIso) {
+      if (!lastPollIso) return 'health-red';
+      const secs = Math.floor((Date.now() - new Date(lastPollIso)) / 1000);
+      if (secs < 600) return 'health-green';
+      if (secs < 1200) return 'health-yellow';
+      return 'health-red';
+    }
+
+    function formatLogTime(tsStr) {
+      // tsStr = "YYYY-MM-DD HH:MM:SS"
+      if (!tsStr) return '';
+      const parts = tsStr.split(' ');
+      if (parts.length < 2) return tsStr;
+      const timeParts = parts[1].split(':');
+      if (timeParts.length < 3) return parts[1];
+      let h = parseInt(timeParts[0], 10);
+      const m = timeParts[1];
+      const ampm = h >= 12 ? 'PM' : 'AM';
+      if (h === 0) h = 12;
+      else if (h > 12) h -= 12;
+      return h + ':' + m + ' ' + ampm;
+    }
+
+    function truncate(str, max) {
+      if (!str) return '';
+      if (str.length <= max) return str;
+      return str.slice(0, max).trimEnd() + '...';
+    }
+
+    /* ── Parse log lines ── */
+    function parseLogLines(text) {
+      if (!text) return [];
+      const lines = text.split('\n');
+      const entries = [];
+
+      for (const line of lines) {
+        // Match: YYYY-MM-DD HH:MM:SS,mmm [LEVEL] message
+        const m = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \[(\w+)\] (.+)$/);
+        if (!m) continue;
+        const [, ts, level, msg] = m;
+
+        // Skip "Spawned agent" lines (redundant with "Dispatched issue")
+        if (msg.includes('Spawned agent')) continue;
+
+        let icon, border, headline, detail;
+
+        if (msg.includes('Dispatcher starting')) {
+          icon = '\uD83D\uDD04'; border = 'grey'; headline = 'Cycle started'; detail = '';
+        } else if (msg.includes('Dispatcher cycle complete') || msg.includes('cycle complete')) {
+          icon = '\u2705'; border = 'green'; headline = 'Cycle complete'; detail = msg;
+        } else if (msg.includes('Dispatched issue')) {
+          icon = '\uD83D\uDE80'; border = 'blue';
+          const dm = msg.match(/#(\d+).*?to\s+(\S+).*?pid[:\s]+(\d+)/i);
+          headline = dm ? 'Dispatched #' + dm[1] + ' to ' + dm[2] : 'Dispatched issue';
+          detail = dm ? 'PID ' + dm[3] : msg;
+        } else if (msg.includes('agent completed') || msg.includes('Agent completed')) {
+          icon = '\u2714\uFE0F'; border = 'green';
+          const cm = msg.match(/#(\d+).*?pid[:\s]+(\d+)/i);
+          const cm2 = cm || msg.match(/#(\d+)/);
+          headline = cm2 ? 'Agent completed #' + cm2[1] : 'Agent completed';
+          detail = cm ? 'PID ' + cm[2] : msg;
+        } else if (msg.includes('crashed') || msg.includes('no meaningful output')) {
+          icon = '\uD83D\uDC80'; border = 'red';
+          const xm = msg.match(/#(\d+)/);
+          headline = xm ? 'Agent crashed #' + xm[1] : 'Agent crashed';
+          detail = msg;
+        } else if (msg.includes('blocked')) {
+          icon = '\uD83D\uDED1'; border = 'yellow';
+          const bm = msg.match(/#(\d+)/);
+          headline = bm ? 'Agent blocked #' + bm[1] : 'Agent blocked';
+          detail = msg;
+        } else if (msg.includes('timed out') || msg.includes('Timed out')) {
+          icon = '\u23F0'; border = 'yellow';
+          const tm = msg.match(/#(\d+)/);
+          headline = tm ? 'Timed out #' + tm[1] : 'Timed out';
+          const dur = msg.match(/(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?|m|min|minutes?|h|hours?)/i);
+          detail = dur ? dur[0] : msg;
+        } else if (msg.includes('Auto-routing') || msg.includes('Auto-routed')) {
+          icon = '\u27A1\uFE0F'; border = 'grey';
+          const am = msg.match(/#(\d+).*?to\s+(\S+)/i);
+          headline = am ? 'Auto-routed #' + am[1] + ' to ' + am[2] : 'Auto-routed';
+          detail = msg;
+        } else if (msg.includes('Merge conflict')) {
+          icon = '\u26A0\uFE0F'; border = 'yellow';
+          const mm = msg.match(/#(\d+)/);
+          headline = mm ? 'Merge conflict #' + mm[1] : 'Merge conflict';
+          detail = msg;
+        } else if (msg.includes('GraphQL error') || level === 'ERROR') {
+          icon = '\u26A0\uFE0F'; border = 'red';
+          headline = 'Error: ' + truncate(msg, 80);
+          detail = msg;
+        } else if (level === 'WARNING') {
+          icon = '\u26A0\uFE0F'; border = 'yellow';
+          headline = 'Warning';
+          detail = msg;
+        } else {
+          // Skip unrecognized INFO lines
+          if (level === 'INFO') continue;
+          icon = '\u2139\uFE0F'; border = 'grey';
+          headline = msg;
+          detail = '';
+        }
+
+        entries.push({ ts, level, msg, icon, border, headline, detail });
+      }
+
+      entries.reverse();
+      return entries;
+    }
+
+    /* ── Parse projects markdown ── */
+    function parseProjectsMarkdown(md) {
+      if (!md) return [];
+
+      // Stop at Quick Reference Table
+      const stopIdx = md.indexOf('## Quick Reference Table');
+      const content = stopIdx >= 0 ? md.slice(0, stopIdx) : md;
+
+      const blocks = content.split(/(?=^### \d+\.)/m);
+      const results = [];
+
+      for (const block of blocks) {
+        const headingMatch = block.match(/^### (\d+)\.\s*(.+)/m);
+        if (!headingMatch) continue;
+
+        const number = parseInt(headingMatch[1], 10);
+        const headingText = headingMatch[2].trim();
+
+        // Extract emoji and name from heading
+        // Patterns: "EMOJI Name - Subtitle" or "EMOJI Name" or "Name - Subtitle"
+        let emoji = '';
+        let name = headingText;
+
+        // Check for leading emoji (common Unicode emoji ranges or status indicators)
+        const emojiMatch = headingText.match(/^([\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE00}-\u{FEFF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{1F900}-\u{1F9FF}\u{2702}-\u{27B0}\u{231A}-\u{23F3}]+\uFE0F?|[\uD83C-\uDBFF][\uDC00-\uDFFF]\uFE0F?)\s*/u);
+        if (emojiMatch) {
+          emoji = emojiMatch[1];
+          name = headingText.slice(emojiMatch[0].length);
+        }
+
+        // Remove anchor tags like {#id}
+        name = name.replace(/\s*\{#[^}]+\}/, '').trim();
+
+        const lines = block.split('\n');
+
+        // Extract fields
+        let path = '', status = '', statusEmoji = '', type = '', github = '', classification = '';
+        let descLines = [];
+        let extraLines = [];
+        let pastFields = false;
+        let foundDesc = false;
+
+        for (let i = 1; i < lines.length; i++) {
+          const line = lines[i];
+
+          const pathM = line.match(/\*\*Path:\*\*\s*`([^`]+)`/);
+          if (pathM) { path = pathM[1]; continue; }
+
+          const statusM = line.match(/\*\*Status:\*\*\s*(.+)/);
+          if (statusM) {
+            status = statusM[1].trim();
+            // Extract status emoji
+            const se = status.match(/^([\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE00}-\u{FEFF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{1F900}-\u{1F9FF}\u{2702}-\u{27B0}\u{231A}-\u{23F3}\u2705\u274C]+\uFE0F?)\s*/u);
+            if (se) statusEmoji = se[1];
+            continue;
+          }
+
+          const typeM = line.match(/\*\*Type:\*\*\s*(.+)/);
+          if (typeM) { type = typeM[1].trim(); continue; }
+
+          const ghM = line.match(/\*\*GitHub:\*\*\s*(.+)/);
+          if (ghM) { github = ghM[1].trim(); continue; }
+
+          const classM = line.match(/\*\*Classification:\*\*\s*`?\[?([^\]`]+)/);
+          if (classM) { classification = classM[1].trim().replace(/\]$/, ''); continue; }
+
+          // Skip other field lines
+          if (line.match(/^\*\*\w+.*:\*\*/)) { continue; }
+
+          // Skip horizontal rules
+          if (line.match(/^---\s*$/)) continue;
+
+          // Skip empty lines before description
+          if (!foundDesc && line.trim() === '') continue;
+
+          // Skip history.md links
+          if (line.match(/^\*\*\uD83D\uDCC4/)) continue;
+
+          // First non-empty, non-field paragraph is description
+          if (!foundDesc && line.trim()) {
+            foundDesc = true;
+            descLines.push(line.trim());
+          } else if (foundDesc) {
+            extraLines.push(line);
+          }
+        }
+
+        // Classify status category
+        let statusCategory = 'other';
+        if (status.includes('\uD83D\uDFE2') || status.toLowerCase().includes('active')) statusCategory = 'active';
+        else if (status.includes('\u2705') || status.toLowerCase().includes('complete') || status.toLowerCase().includes('live') || status.toLowerCase().includes('testflight')) statusCategory = 'complete';
+        else if (status.includes('\uD83D\uDEA7') || status.includes('\uD83D\uDFE1') || status.toLowerCase().includes('in progress') || status.toLowerCase().includes('mostly complete')) statusCategory = 'in-progress';
+        else if (status.includes('\uD83D\uDCA4') || status.toLowerCase().includes('on hold') || status.toLowerCase().includes('hold') || status.toLowerCase().includes('paused')) statusCategory = 'on-hold';
+        else if (status.includes('\uD83D\uDDC4') || status.toLowerCase().includes('archived')) statusCategory = 'archived';
+
+        const description = descLines.join(' ').trim();
+        const extras = extraLines.filter(l => l.trim()).join('\n').trim();
+
+        // Extract GitHub URL from markdown link if present
+        const ghUrlMatch = github.match(/\[([^\]]*)\]\(([^)]+)\)/);
+        const githubUrl = ghUrlMatch ? ghUrlMatch[2] : (github.startsWith('http') ? github : '');
+
+        results.push({
+          number,
+          emoji,
+          name,
+          path,
+          status,
+          statusEmoji,
+          type,
+          classification,
+          github: githubUrl,
+          description,
+          extras,
+          statusCategory,
+          parseError: !name
+        });
+      }
+
+      return results;
+    }
+
+    /* ── Renderers ── */
+
+    function renderHeader(st, cfg) {
+      const el = document.getElementById('header');
+      const lastPoll = st && st.last_poll ? st.last_poll : null;
+      const running = st && st.running ? Object.keys(st.running).length : 0;
+      const maxC = cfg ? cfg.max_concurrent : '?';
+      const hc = healthClass(lastPoll);
+
+      el.innerHTML = `
+        <div class="header-inner">
+          <div class="header-left">
+            <span class="header-title">Half Bakery</span>
+            <span class="health-dot ${hc}" title="Dispatcher health"></span>
+          </div>
+          <div class="header-right">
+            <span class="last-poll-ago" data-poll="${lastPoll || ''}">Last poll: ${lastPoll ? timeAgo(lastPoll) : 'unknown'}</span>
+            <span class="sep">|</span>
+            <span class="next-poll-str" data-poll="${lastPoll || ''}">Next poll: ${nextPollStr(lastPoll)}</span>
+            <span class="sep">|</span>
+            <span>Agents: ${running}/${maxC} running</span>
+          </div>
+        </div>`;
+    }
+
+    function renderAgents(st, cfg) {
+      const el = document.getElementById('agents');
+      const running = st && st.running ? st.running : {};
+      const keys = Object.keys(running);
+      const repo = cfg ? cfg.github_repo : 'your-username/your-repo';
+
+      let html = '<div class="section-title">Running Agents <span class="section-count">(' + keys.length + ')</span></div>';
+
+      if (keys.length === 0) {
+        html += `<div class="no-agents">
+          <div class="big-icon">\uD83C\uDF5E</div>
+          <div>No agents running</div>
+          <div style="margin-top:4px;font-size:12px;color:var(--text-muted)">Next poll: ${nextPollStr(st ? st.last_poll : null)}</div>
+        </div>`;
+      } else {
+        html += '<div class="card-grid">';
+        for (const num of keys) {
+          const info = running[num];
+          const agent = info.agent || 'unknown';
+          const badgeClass = 'badge-' + agent;
+          const agentLabel = agent.replace(/-/g, ' ');
+          const project = info.project || '';
+          const column = info.column || '';
+          const started = info.started || '';
+          const issueRepo = info.issue_repo || repo;
+          const issueUrl = 'https://github.com/' + esc(issueRepo) + '/issues/' + esc(num);
+
+          html += `<div class="card agent-card">
+            <div class="agent-card-header">
+              <span class="agent-issue-num"><a href="${issueUrl}" target="_blank">#${esc(num)}</a></span>
+              <span class="badge ${badgeClass}">${esc(agentLabel)}</span>
+            </div>
+            <div class="agent-detail"><span class="label">Project:</span> ${esc(project)}</div>
+            <div class="agent-detail"><span class="label">Column:</span> ${esc(column)}</div>
+            <div class="agent-detail"><span class="label">Elapsed:</span> <span class="elapsed" data-started="${esc(started)}">0m 00s</span></div>
+          </div>`;
+        }
+        html += '</div>';
+      }
+
+      el.innerHTML = html;
+    }
+
+    function renderActivity(entries) {
+      const el = document.getElementById('activity');
+      const shown = entries.slice(0, 50);
+
+      let html = '<div class="section-title">Recent Activity <span class="section-count">(' + shown.length + ')</span></div>';
+      html += '<div class="activity-list">';
+
+      if (shown.length === 0) {
+        html += '<div class="no-agents">No log entries</div>';
+      }
+
+      for (const e of shown) {
+        const displayTime = formatLogTime(e.ts);
+        html += `<div class="activity-card border-${e.border}">
+          <span class="activity-icon">${e.icon}</span>
+          <div class="activity-body">
+            <div class="activity-headline">${esc(e.headline)}</div>
+            ${e.detail ? '<div class="activity-detail">' + esc(e.detail) + '</div>' : ''}
+          </div>
+          <span class="activity-time" title="${esc(e.ts)}">${esc(displayTime)}</span>
+        </div>`;
+      }
+
+      html += '</div>';
+      el.innerHTML = html;
+    }
+
+    function renderProjects(projs, filter, search) {
+      const el = document.getElementById('projects');
+
+      // Count by category
+      const counts = { all: projs.length, active: 0, complete: 0, 'in-progress': 0, 'on-hold': 0, archived: 0, other: 0 };
+      for (const p of projs) {
+        if (counts[p.statusCategory] !== undefined) counts[p.statusCategory]++;
+        else counts.other++;
+      }
+
+      // Filter
+      let filtered = projs;
+      if (filter !== 'all') {
+        filtered = filtered.filter(p => p.statusCategory === filter);
+      }
+      if (search) {
+        const s = search.toLowerCase();
+        filtered = filtered.filter(p =>
+          (p.name && p.name.toLowerCase().includes(s)) ||
+          (p.description && p.description.toLowerCase().includes(s)) ||
+          (p.type && p.type.toLowerCase().includes(s)) ||
+          (p.path && p.path.toLowerCase().includes(s))
+        );
+      }
+
+      // Build HTML
+      const categories = [
+        ['all', 'All'],
+        ['active', 'Active'],
+        ['in-progress', 'In Progress'],
+        ['complete', 'Complete'],
+        ['on-hold', 'On Hold'],
+        ['archived', 'Archived']
+      ];
+
+      let html = '<div class="section-title">Projects <span class="section-count">(' + filtered.length + ')</span></div>';
+      html += '<div class="filter-bar">';
+      for (const [key, label] of categories) {
+        if (counts[key] === undefined || (key !== 'all' && counts[key] === 0)) continue;
+        const isActive = filter === key ? ' active' : '';
+        html += `<button class="filter-btn${isActive}" data-filter="${key}">${label}<span class="count">${counts[key]}</span></button>`;
+      }
+      html += `<input type="text" class="search-input" placeholder="Search projects..." value="${esc(search)}">`;
+      html += '</div>';
+
+      html += '<div class="card-grid">';
+      for (const p of filtered) {
+        const isExpanded = expandedProjects.has(p.number);
+        const expandedClass = isExpanded ? ' expanded' : '';
+
+        html += `<div class="card project-card${expandedClass}" data-project="${p.number}">`;
+
+        if (p.parseError) {
+          html += `<div class="project-parse-error">Parse error for project #${p.number}</div>`;
+        }
+
+        html += `<div class="project-name">`;
+        if (p.emoji) html += `<span class="emoji">${p.emoji}</span>`;
+        html += `${esc(p.name)}</div>`;
+
+        if (p.status) {
+          html += `<div class="project-status">${esc(p.status)}</div>`;
+        }
+
+        if (isExpanded) {
+          // Full description
+          if (p.description) {
+            html += `<div class="project-desc">${esc(p.description)}</div>`;
+          }
+          html += '<div class="project-expanded">';
+          if (p.path) html += `<div class="field"><span class="label">Path:</span> <code>${esc(p.path)}</code></div>`;
+          if (p.type) html += `<div class="field"><span class="label">Type:</span> ${esc(p.type)}</div>`;
+          if (p.classification) html += `<div class="field"><span class="label">Classification:</span> ${esc(p.classification)}</div>`;
+          if (p.github) html += `<div class="field"><span class="label">GitHub:</span> <a href="${esc(p.github)}" target="_blank">${esc(p.github)}</a></div>`;
+          if (p.extras) html += `<div class="extras">${esc(p.extras)}</div>`;
+          html += '</div>';
+        } else {
+          // Truncated description
+          if (p.description) {
+            html += `<div class="project-desc">${esc(truncate(p.description, 120))}</div>`;
+          }
+        }
+
+        html += '<div class="project-meta">';
+        if (p.classification) {
+          const cls = p.classification.toLowerCase();
+          const clsClass = cls.includes('public') ? 'cls-public' : 'cls-private';
+          const deployClass = cls.includes('aws') ? 'cls-aws' : 'cls-local';
+          html += `<span class="project-cls-badge ${clsClass}">${cls.includes('public') ? 'Public' : 'Private'}</span>`;
+          html += `<span class="project-cls-badge ${deployClass}">${cls.includes('aws') ? 'AWS' : 'Local'}</span>`;
+        }
+        if (p.type) html += `<span class="project-type-badge">${esc(p.type)}</span>`;
+        if (p.github) html += `<span class="project-github-indicator">\uD83D\uDD17 GitHub</span>`;
+        html += '</div>';
+
+        html += '</div>';
+      }
+      html += '</div>';
+
+      const hadSearchFocus = document.activeElement && document.activeElement.classList.contains('search-input');
+
+      el.innerHTML = html;
+
+      // Wire up event handlers
+      el.querySelectorAll('.project-card').forEach(card => {
+        card.addEventListener('click', (e) => {
+          // Don't toggle if clicking a link
+          if (e.target.tagName === 'A') return;
+          const num = parseInt(card.dataset.project, 10);
+          if (expandedProjects.has(num)) {
+            expandedProjects.delete(num);
+          } else {
+            expandedProjects.add(num);
+          }
+          renderProjects(projects, activeFilter, searchTerm);
+        });
+      });
+
+      el.querySelectorAll('.filter-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          activeFilter = btn.dataset.filter;
+          renderProjects(projects, activeFilter, searchTerm);
+        });
+      });
+
+      const searchInput = el.querySelector('.search-input');
+      if (searchInput) {
+        searchInput.addEventListener('input', (e) => {
+          searchTerm = e.target.value;
+          renderProjects(projects, activeFilter, searchTerm);
+        });
+        if (hadSearchFocus && searchInput) {
+          searchInput.focus();
+          searchInput.selectionStart = searchInput.selectionEnd = searchInput.value.length;
+        }
+      }
+    }
+
+    function renderPipeline(cfg) {
+      const el = document.getElementById('pipeline');
+      if (!cfg || !cfg.columns) {
+        el.innerHTML = '<div class="section-title">Pipeline Routes</div><div class="no-agents">Config not loaded</div>';
+        return;
+      }
+
+      let html = '<div class="section-title">Pipeline Routes</div>';
+
+      // Main flow: Ready -> Engineering -> QA -> Docs -> Done
+      html += '<div class="pipeline-main">';
+      html += '<span class="pipeline-node node-ready">Ready</span>';
+      html += '<span class="pipeline-arrow">\u2192</span>';
+      html += '<span class="pipeline-node node-engineering">Engineering</span>';
+      html += '<span class="pipeline-arrow">\u2192</span>';
+      html += '<span class="pipeline-node node-qa">QA</span>';
+      html += '<span class="pipeline-arrow">\u2192</span>';
+      html += '<span class="pipeline-node node-docs">Docs</span>';
+      html += '<span class="pipeline-arrow">\u2192</span>';
+      html += '<span class="pipeline-node node-done">Done</span>';
+      html += '</div>';
+
+      // Alternate routes
+      const altRoutes = [];
+      const mainFlow = ['Engineering', 'QA', 'Docs'];
+      for (const [col, info] of Object.entries(cfg.columns)) {
+        if (!mainFlow.includes(col)) {
+          altRoutes.push({ from: col, agent: info.agent, to: info.next });
+        }
+      }
+
+      if (altRoutes.length > 0) {
+        html += '<div class="pipeline-alt">';
+        html += '<span class="route-label">Alternate routes:</span><br>';
+        for (const r of altRoutes) {
+          const fromCls = 'node-' + r.from.toLowerCase().replace(/\s+/g, '-');
+          const toCls   = 'node-' + r.to.toLowerCase().replace(/\s+/g, '-');
+          html += '<span class="pipeline-node ' + fromCls + '" style="font-size:12px;padding:3px 10px">' + esc(r.from) + '</span>';
+          html += ' <span style="color:var(--text-muted);font-size:11px">(' + esc(r.agent) + ')</span> ';
+          html += '<span class="pipeline-arrow">\u2192</span> ';
+          html += '<span class="pipeline-node ' + toCls + '" style="font-size:12px;padding:3px 10px">' + esc(r.to) + '</span><br>';
+        }
+        html += '</div>';
+      }
+
+      el.innerHTML = html;
+    }
+
+    /* ── Poll loops ── */
+
+    function updateElapsedTimes() {
+      document.querySelectorAll('.elapsed[data-started]').forEach(el => {
+        const started = new Date(el.dataset.started);
+        const elapsed = Math.floor((Date.now() - started) / 1000);
+        if (elapsed < 0) { el.textContent = '0m 00s'; return; }
+        const m = Math.floor(elapsed / 60);
+        const s = elapsed % 60;
+        el.textContent = m + 'm ' + s.toString().padStart(2, '0') + 's';
+      });
+      // Tick header timers independently of pollState
+      const lp = document.querySelector('.last-poll-ago[data-poll]');
+      if (lp && lp.dataset.poll) lp.textContent = 'Last poll: ' + timeAgo(lp.dataset.poll);
+      const np = document.querySelector('.next-poll-str[data-poll]');
+      if (np) np.textContent = 'Next poll: ' + nextPollStr(np.dataset.poll || null);
+    }
+
+    async function pollState() {
+      state = await fetchJSON('/api/state');
+      const logText = await fetchText('/api/log?tail=100');
+      logEntries = parseLogLines(logText);
+      if (state && config) {
+        renderHeader(state, config);
+        renderAgents(state, config);
+        updateElapsedTimes();
+      }
+      renderActivity(logEntries);
+    }
+
+    async function pollProjects() {
+      const md = await fetchText('/api/projects');
+      projects = parseProjectsMarkdown(md);
+      renderProjects(projects, activeFilter, searchTerm);
+    }
+
+    /* ── Tab switching ── */
+
+    document.getElementById('tab-bar').addEventListener('click', e => {
+      const btn = e.target.closest('.tab-btn');
+      if (!btn) return;
+      const tab = btn.dataset.tab;
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === btn));
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tab));
+    });
+
+    async function init() {
+      config = await fetchJSON('/api/config');
+      await Promise.all([pollState(), pollProjects()]);
+      if (config) renderPipeline(config);
+      setInterval(pollState, 5000);
+      setInterval(pollProjects, 60000);
+      setInterval(updateElapsedTimes, 1000);
+    }
+
+    init();
+  </script>
+</body>
+</html>

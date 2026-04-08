@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Half Bakery Dashboard — launch script
+# Usage: ./dashboard/run [port]
+# Starts the dashboard server, opens browser, Ctrl+C to stop.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PORT="${1:-${PORT:-8484}}"
+
+# Check if port is in use
+if lsof -i :"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "Error: port $PORT is already in use" >&2
+    exit 1
+fi
+
+# Start server in background
+python3 "$SCRIPT_DIR/serve.py" "$PORT" &
+SERVER_PID=$!
+
+# Clean up on exit
+cleanup() {
+    kill "$SERVER_PID" 2>/dev/null
+    wait "$SERVER_PID" 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
+# Wait for server to bind
+sleep 0.5
+
+# Open browser (macOS)
+open "http://localhost:$PORT"
+
+echo "Dashboard running at http://localhost:$PORT (PID $SERVER_PID)"
+echo "Press Ctrl+C to stop."
+
+# Block until killed
+wait "$SERVER_PID"
