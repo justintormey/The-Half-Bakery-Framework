@@ -1,0 +1,15 @@
+{
+  "columns": {
+    "Research":     { "agent": "research-analyst",  "next": "Ready" },
+    "Architecture": { "agent": "architect",         "next": "Ready" },
+    "Engineering":  { "agent": "founding-engineer",  "next": "QA" },
+    "QA":           { "agent": "qa",                "next": "Docs" },
+    "Docs":         { "agent": "documentarian",     "next": "Done" }
+  },
+  "auto_route_keywords": {
+    "Engineering":  ["bug", "fix", "error", "broken", "crash", "implement", "build", "add", "create"],
+    "Research":     ["research", "investigate", "explore", "analyze", "compare", "survey", "evaluate"],
+    "Architecture": ["design", "architecture", "RFC", "system design", "plan"]
+  },
+  "default_route": "Engineering"
+}
