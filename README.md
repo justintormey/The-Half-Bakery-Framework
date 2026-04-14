@@ -1,4 +1,4 @@
-# Half Bakery
+# The Half Bakery Framework
 
 **Your ideas are half-baked. Let the agents finish cooking.**
 
