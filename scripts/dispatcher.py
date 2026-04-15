@@ -18,6 +18,12 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Smart dispatcher v3 modules
+from budget import get_budget_profile, should_defer_issue, update_session_stats, get_budget_summary
+from discoverer import phase_discover
+from evaluator import evaluate, classify_issue, _extract_summary as eval_extract_summary, extract_verdict
+from usage_tracker import get_usage_status, save_snapshot, record_session, prune_session_log
+
 DRY_RUN = False
 
 # ---------------------------------------------------------------------------
@@ -381,54 +387,68 @@ def get_project_fields(config):
 # ---------------------------------------------------------------------------
 
 def poll_board(config, fields_cache, routes):
-    """Query the board for dispatchable issues."""
+    """Query the board for dispatchable issues. Paginates to get ALL items."""
     owner = config["github_repo"].split("/")[0]
     project_num = config["github_project_number"]
-    query = f'''query {{
-        user(login: "{owner}") {{
-            projectV2(number: {project_num}) {{
-                items(first: 100) {{
-                    nodes {{
-                        id
-                        content {{
-                            ... on Issue {{
-                                number
-                                title
-                                state
-                                body
-                                repository {{ name nameWithOwner }}
-                                subIssues(first: 20) {{
-                                    nodes {{ number title state }}
-                                    totalCount
+
+    all_nodes = []
+    cursor = None
+    while True:
+        after = f', after: "{cursor}"' if cursor else ""
+        query = f'''query {{
+            user(login: "{owner}") {{
+                projectV2(number: {project_num}) {{
+                    items(first: 100{after}) {{
+                        pageInfo {{ hasNextPage endCursor }}
+                        nodes {{
+                            id
+                            content {{
+                                ... on Issue {{
+                                    number
+                                    title
+                                    state
+                                    body
+                                    repository {{ name nameWithOwner }}
+                                    subIssues(first: 20) {{
+                                        nodes {{ number title state }}
+                                        totalCount
+                                    }}
+                                    subIssuesSummary {{ completed total percentCompleted }}
+                                    parent {{ number title state body repository {{ nameWithOwner }} }}
                                 }}
-                                subIssuesSummary {{ completed total percentCompleted }}
-                                parent {{ number title state body repository {{ nameWithOwner }} }}
                             }}
-                        }}
-                        fieldValues(first: 15) {{
-                            nodes {{
-                                ... on ProjectV2ItemFieldSingleSelectValue {{
-                                    name
-                                    field {{ ... on ProjectV2SingleSelectField {{ name }} }}
-                                }}
-                                ... on ProjectV2ItemFieldTextValue {{
-                                    text
-                                    field {{ ... on ProjectV2Field {{ name }} }}
+                            fieldValues(first: 15) {{
+                                nodes {{
+                                    ... on ProjectV2ItemFieldSingleSelectValue {{
+                                        name
+                                        field {{ ... on ProjectV2SingleSelectField {{ name }} }}
+                                    }}
+                                    ... on ProjectV2ItemFieldTextValue {{
+                                        text
+                                        field {{ ... on ProjectV2Field {{ name }} }}
+                                    }}
                                 }}
                             }}
                         }}
                     }}
                 }}
             }}
-        }}
-    }}'''
-    data = gh_graphql(query)
-    if not data:
-        return []
+        }}'''
+        data = gh_graphql(query)
+        if not data:
+            break
+
+        items_data = data["data"]["user"]["projectV2"]["items"]
+        all_nodes.extend(items_data["nodes"])
+
+        if items_data["pageInfo"]["hasNextPage"]:
+            cursor = items_data["pageInfo"]["endCursor"]
+        else:
+            break
 
     dispatchable_columns = set(routes["columns"].keys()) | {"Ready"}
     items = []
-    for node in data["data"]["user"]["projectV2"]["items"]["nodes"]:
+    for node in all_nodes:
         content = node.get("content")
         if not content or content.get("state") != "OPEN":
             continue
@@ -602,7 +622,10 @@ def merge_worktree(project_dir, branch_name):
     """Merge the agent branch back into the project's default branch.
 
     Returns (success: bool, error_reason: str or None).
-    Pre-checks: aborts stale merges, verifies branch, stashes dirty tree.
+    Pre-checks: aborts stale merges, verifies branch, auto-commits dirty tree.
+    Config-protection: files under config/ are reset to HEAD before any
+    auto-commit so the dispatcher can never silently clobber config changes
+    made by agents or humans (fix for issue #117).
     Post-failure: aborts failed merge to leave repo clean.
     """
     # Pre-check 1: Abort any in-progress merge
@@ -622,19 +645,49 @@ def merge_worktree(project_dir, branch_name):
     if result.returncode != 0:
         return False, f"Branch {branch_name} does not exist"
 
-    # Pre-check 3: Stash dirty working tree if needed
+    # Pre-check 3: Auto-commit dirty working tree so merges start clean.
+    # IMPORTANT: Config files are protected — if any file under config/ is dirty,
+    # we reset it to HEAD before committing.  Auto-commits must never clobber
+    # intentional architectural decisions made by agents or humans.
+    # See: 
     status_result = subprocess.run(
         ["git", "-C", project_dir, "status", "--porcelain"],
         capture_output=True, text=True,
     )
-    had_dirty_tree = bool(status_result.stdout.strip())
-    if had_dirty_tree:
-        log.warning("Working tree dirty in %s, stashing before merge", project_dir)
-        subprocess.run(
-            ["git", "-C", project_dir, "stash", "push", "-m",
-             f"dispatcher-auto-stash-before-merge-{branch_name}"],
+    if status_result.stdout.strip():
+        # Identify dirty files under config/ and reset them to HEAD
+        dirty_config_files = [
+            line[3:]  # strip the two-char status prefix + space
+            for line in status_result.stdout.splitlines()
+            if line[3:].startswith("config/")
+        ]
+        if dirty_config_files:
+            log.warning(
+                "Auto-commit protection: resetting %d config file(s) to HEAD in %s "
+                "to prevent clobbering intentional config changes: %s",
+                len(dirty_config_files), project_dir, dirty_config_files,
+            )
+            subprocess.run(
+                ["git", "-C", project_dir, "checkout", "HEAD", "--"] + dirty_config_files,
+                capture_output=True, text=True,
+            )
+
+        # Re-check after resetting protected files — may be clean now
+        status_result2 = subprocess.run(
+            ["git", "-C", project_dir, "status", "--porcelain"],
             capture_output=True, text=True,
         )
+        if status_result2.stdout.strip():
+            log.info("Auto-committing dirty working tree in %s before merge", project_dir)
+            subprocess.run(
+                ["git", "-C", project_dir, "add", "-A"],
+                capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["git", "-C", project_dir, "commit", "-m",
+                 "chore(dispatcher): auto-commit dirty tree before merge"],
+                capture_output=True, text=True,
+            )
 
     # Attempt the merge
     result = subprocess.run(
@@ -650,19 +703,7 @@ def merge_worktree(project_dir, branch_name):
             ["git", "-C", project_dir, "merge", "--abort"],
             capture_output=True, text=True,
         )
-        if had_dirty_tree:
-            subprocess.run(
-                ["git", "-C", project_dir, "stash", "pop"],
-                capture_output=True, text=True,
-            )
         return False, error_msg
-
-    # Restore stashed changes after successful merge
-    if had_dirty_tree:
-        subprocess.run(
-            ["git", "-C", project_dir, "stash", "pop"],
-            capture_output=True, text=True,
-        )
 
     return True, None
 
@@ -765,13 +806,19 @@ You are a headless agent. Follow these rules:
 ## Instructions
 1. {work_scope}
 2. Read the project's CLAUDE.md or history.md if it exists before starting.
-3. Do the work described in the issue.
-4. Commit your changes with clear messages referencing issue #{item['issue_number']}.
-5. If you create any GitHub issues, immediately add each one to the project board:
+3. Read half-bakery/docs/project-visions.md for the owner's vision and priorities.
+4. Do the work described in the issue.
+5. ALL output (code, docs, research, architecture, reports) goes in YOUR PROJECT'S
+   directory — NEVER in the half-bakery repo. The half-bakery repo is infrastructure
+   only. Your working directory is your project. Write docs in your project's docs/
+   or research/ folders. The only exception is half-bakery/docs/project-visions.md
+   which you may READ but never WRITE.
+6. Commit your changes with clear messages referencing issue #{item['issue_number']}.
+7. If you create any GitHub issues, immediately add each one to the project board:
    gh project item-add {config['github_project_number']} --owner {config['github_repo'].split('/')[0]} --url <issue-url>
-6. If you are blocked and cannot complete the work, output a line starting
+8. If you are blocked and cannot complete the work, output a line starting
    with "##BLOCKED##" followed by what's blocking you.
-7. When done, output this EXACT block (fill in each field):
+9. When done, output this EXACT block (fill in each field):
    ##SUMMARY##
    DONE: <one sentence of what was accomplished>
    FILES: <comma-separated list of changed files>
@@ -797,6 +844,16 @@ You may read, modify, and commit in any of them:
             notes = history_text.split("## Important Notes")[1].split("\n##")[0].strip()
             if notes:
                 assignment += f"\n## Project Notes (from history.md)\n{notes}\n"
+
+    # Retry context: inject failure info so agent doesn't repeat mistakes
+    if item.get("retry_context"):
+        ctx = item["retry_context"]
+        assignment += f"""
+## Prior Attempt Failed (Retry {ctx['retry_count']})
+**Reason:** {ctx['prior_failure']}
+Do NOT repeat the same mistake. Address the issue directly.
+Read the evaluation failure reason carefully and correct your approach.
+"""
 
     # Epic context enrichment: inject parent Epic info for sub-issues.
     if item.get("parent"):
@@ -831,8 +888,14 @@ do not attempt to do work assigned to other sub-issues.
                  agent_type, item["issue_number"], worktree_path)
         return None
 
+    # Select model per agent type (default: opus)
+    agent_models = config.get("agent_models", {})
+    model = agent_models.get(agent_type, "opus")
+
     cmd = [
         CLAUDE_BIN, "--print",
+        "--output-format", "json",
+        "--model", model,
         "--system-prompt", system_prompt,
         "--append-system-prompt", assignment,
         "--add-dir", worktree_path,
@@ -847,6 +910,8 @@ do not attempt to do work assigned to other sub-issues.
         "--name", f"half-bakery-{item['issue_number']}-{agent_type}",
         "Execute the assignment above.",
     ])
+
+    log.info("Agent %s using model: %s", agent_type, model)
 
     try:
         with open(output_file, "w") as out:
@@ -864,6 +929,196 @@ do not attempt to do work assigned to other sub-issues.
     log.info("Spawned agent %s for issue #%d (PID %d)",
              agent_type, item["issue_number"], proc.pid)
     return proc.pid
+
+
+def spawn_local_agent(config, provider, routes, item, worktree_path):
+    """Spawn a local LLM agent via local_agent.py for this issue.
+
+    Uses the same assignment prompt as spawn_agent() but routes to a local
+    llama-server via the OpenAI-compatible API instead of the claude CLI.
+    Returns None (triggering fallback) if the server is unreachable.
+    """
+    # Health check: is the local server reachable?
+    base_url = provider.get("base_url", "")
+    if base_url:
+        import urllib.request
+        try:
+            health_url = base_url.rstrip("/").rsplit("/v1", 1)[0] + "/health"
+            req = urllib.request.Request(health_url, method="GET")
+            urllib.request.urlopen(req, timeout=3)
+        except Exception:
+            log.info("Local provider at %s is unreachable, skipping", base_url)
+            return None
+
+    agent_type = routes["columns"][item["status"]]["agent"]
+    agents_root = Path(config["agents_root"])
+    agents_md = agents_root / agent_type / "AGENTS.md"
+
+    if not agents_md.exists():
+        log.error("Agent file not found: %s", agents_md)
+        return None
+
+    # Build the same assignment prompt as spawn_agent
+    is_spanning = item.get("target_project") in config.get("spanning_projects", [])
+    sibling_projects = []
+    if is_spanning:
+        sibling_projects = get_sibling_projects(
+            config["projects_root"],
+            exclude=[item["target_project"]],
+        )
+
+    if is_spanning and sibling_projects:
+        work_scope = (f"Your primary working directory is {worktree_path}/, "
+                      f"but you also have access to the sibling projects listed below.")
+    else:
+        work_scope = f"Work ONLY in your assigned directory: {worktree_path}/"
+
+    assignment = f"""## Your Assignment
+
+**Issue:** #{item['issue_number']} — {item['title']}
+**Project:** {item.get('target_project', 'unknown')}
+**Working directory:** {worktree_path}/
+**Pipeline stage:** {item['status']}
+
+## Operational Constraints
+You are a headless agent running on a local LLM. Follow these rules:
+- Execute the assignment directly. Do not ask clarifying questions.
+- Use the provided tools (read_file, write_file, edit_file, bash, grep, glob) to do your work.
+- Commit your changes using the bash tool with git commands.
+- All file paths should be absolute paths.
+
+## Issue Details
+{item['body']}
+
+## Instructions
+1. {work_scope}
+2. Read the project's CLAUDE.md or history.md if it exists before starting.
+3. Read half-bakery/docs/project-visions.md for the owner's vision and priorities.
+4. Do the work described in the issue.
+5. ALL output (code, docs, research, architecture, reports) goes in YOUR PROJECT'S
+   directory — NEVER in the half-bakery repo. The half-bakery repo is infrastructure
+   only. Your working directory is your project. Write docs in your project's docs/
+   or research/ folders. The only exception is half-bakery/docs/project-visions.md
+   which you may READ but never WRITE.
+6. Commit your changes with clear messages referencing issue #{item['issue_number']}.
+7. If you create any GitHub issues, immediately add each one to the project board:
+   gh project item-add {config['github_project_number']} --owner {config['github_repo'].split('/')[0]} --url <issue-url>
+8. If you are blocked and cannot complete the work, output a line starting
+   with "##BLOCKED##" followed by what's blocking you.
+9. When done, output this EXACT block (fill in each field):
+   ##SUMMARY##
+   DONE: <one sentence of what was accomplished>
+   FILES: <comma-separated list of changed files>
+   COMMITS: <commit SHAs or "none">
+   FOLLOWUP: <issues to create, or "none">
+   ##END##
+"""
+
+    if is_spanning and sibling_projects:
+        project_list = "\n".join(f"- {p}" for p in sibling_projects)
+        assignment += f"""
+## Available Projects
+You have direct access to the following project directories.
+You may read, modify, and commit in any of them:
+{project_list}
+"""
+
+    # Retry context
+    if item.get("retry_context"):
+        ctx = item["retry_context"]
+        assignment += f"""
+## Prior Attempt Failed (Retry {ctx['retry_count']})
+**Reason:** {ctx['prior_failure']}
+Do NOT repeat the same mistake. Address the issue directly.
+"""
+
+    output_file = OUTPUT_DIR / f"{item['issue_number']}.log"
+    stderr_file = OUTPUT_DIR / f"{item['issue_number']}.stderr.log"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if DRY_RUN:
+        log.info("[DRY RUN] Would spawn local agent %s for issue #%d in %s",
+                 agent_type, item["issue_number"], worktree_path)
+        return None
+
+    local_agent_script = SCRIPT_DIR / "local_agent.py"
+    if not local_agent_script.exists():
+        log.error("local_agent.py not found at %s", local_agent_script)
+        return None
+
+    cmd = [
+        sys.executable, str(local_agent_script),
+        "--base-url", provider["base_url"],
+        "--model", provider.get("model", "default"),
+        "--persona", str(agents_md),
+        "--assignment", assignment,
+        "--workdir", worktree_path,
+        "--max-turns", str(provider.get("max_turns", 50)),
+        "--ctx-size", str(provider.get("ctx_size", 65536)),
+        "--verbose",
+    ]
+
+    log.info("Local agent %s for issue #%d → %s (model: %s)",
+             agent_type, item["issue_number"],
+             provider["base_url"], provider.get("model", "default"))
+
+    try:
+        # stdout → output_file (JSON only — parsed by phase_harvest)
+        # stderr → stderr_file (verbose progress logs — for debugging)
+        # Keeping them separate prevents verbose output from corrupting json.loads()
+        with open(output_file, "w") as out, open(stderr_file, "w") as err:
+            proc = subprocess.Popen(
+                cmd, stdout=out, stderr=err,
+                cwd=worktree_path,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+            )
+    except OSError as e:
+        log.error("Failed to spawn local agent for issue #%d: %s",
+                  item["issue_number"], e)
+        return None
+
+    log.info("Spawned local agent %s for issue #%d (PID %d)",
+             agent_type, item["issue_number"], proc.pid)
+    return proc.pid
+
+
+def spawn_for_provider(config, routes, item, worktree_path):
+    """Spawn agent using the configured provider, with fallback to claude CLI.
+
+    Checks column-routes.json for a per-column 'provider' override, then
+    falls back to config['default_provider'], then to 'claude'.
+    """
+    column = item["status"]
+    route = routes["columns"].get(column, {})
+    provider_name = route.get("provider", config.get("default_provider", "claude"))
+    providers = config.get("providers", {})
+    provider = providers.get(provider_name, {})
+
+    if provider.get("type") == "local":
+        log.info("Issue #%d: using local provider '%s' for column '%s'",
+                 item["issue_number"], provider_name, column)
+        pid = spawn_local_agent(config, provider, routes, item, worktree_path)
+        if pid is not None:
+            return pid, provider_name
+
+        # Local spawn failed — fall back to the configured fallback provider.
+        # Only "claude" is supported as a fallback; guard against misconfiguration.
+        fallback_name = provider.get("fallback_provider", "claude")
+        if fallback_name != "claude":
+            log.error(
+                "Unsupported fallback_provider '%s' for issue #%d — "
+                "only 'claude' is supported. Defaulting to 'claude'.",
+                fallback_name, item["issue_number"],
+            )
+            fallback_name = "claude"
+        log.warning("Local agent spawn failed for #%d, falling back to '%s'",
+                    item["issue_number"], fallback_name)
+        pid = spawn_agent(config, routes, item, worktree_path)
+        return pid, fallback_name
+    else:
+        pid = spawn_agent(config, routes, item, worktree_path)
+        return pid, "claude"
 
 
 # ---------------------------------------------------------------------------
@@ -897,10 +1152,116 @@ def phase_timeout_check(state, config, fields_cache):
             save_state(state)
 
 
-def phase_poll_and_dispatch(state, config, fields_cache, routes):
-    """Poll the board and dispatch agents for ready issues."""
-    max_concurrent = config.get("max_concurrent", 3)
+def phase_retry_queue(state, config, fields_cache, routes):
+    """Re-dispatch issues from the retry queue with failure context."""
+    retry_queue = state.get("retry_queue", {})
+    if not retry_queue:
+        return
+
+    budget = get_budget_profile(config)
+    max_concurrent = budget["max_concurrent"]
     running_count = len(state["running"])
+
+    for issue_num, retry_info in list(retry_queue.items()):
+        if running_count >= max_concurrent:
+            break
+
+        log.info("Retrying issue #%s (attempt %d, prior: %s)",
+                 issue_num, retry_info["retry_count"], retry_info["prior_failure"])
+
+        target_project = retry_info.get("target_project", "")
+        project_dir = resolve_project_dir(config["projects_root"], target_project)
+        if not project_dir:
+            log.warning("Retry: project dir not found for %s, moving to Stuck", target_project)
+            move_issue_to_column(fields_cache, retry_info.get("item_id", ""), "Review")
+            del retry_queue[issue_num]
+            continue
+
+        result = create_worktree(project_dir, int(issue_num), target_project)
+        if not result:
+            log.error("Retry: failed to create worktree for #%s", issue_num)
+            del retry_queue[issue_num]
+            continue
+        worktree_path, branch_name = result
+
+        # Build a synthetic item for spawn_agent with retry context
+        item = {
+            "issue_number": int(issue_num),
+            "title": retry_info.get("title", ""),
+            "body": retry_info.get("body", ""),
+            "status": retry_info.get("column", "Engineering"),
+            "target_project": target_project,
+            "issue_repo": retry_info.get("issue_repo", config["github_repo"]),
+            "item_id": retry_info.get("item_id", ""),
+            "parent": retry_info.get("parent_issue"),
+            "retry_context": {
+                "retry_count": retry_info["retry_count"],
+                "prior_failure": retry_info["prior_failure"],
+            },
+        }
+
+        # If force_provider is set (e.g., local agent failed), bypass routing
+        if retry_info.get("force_provider") == "claude":
+            log.info("Issue #%s: forced provider 'claude' on retry", issue_num)
+            pid = spawn_agent(config, routes, item, worktree_path)
+            used_provider = "claude"
+        else:
+            pid, used_provider = spawn_for_provider(config, routes, item, worktree_path)
+        if pid is None:
+            cleanup_worktree(project_dir, int(issue_num), target_project)
+            del retry_queue[issue_num]
+            continue
+
+        entry = {
+            "agent": routes["columns"][item["status"]]["agent"],
+            "pid": pid,
+            "started": datetime.now(timezone.utc).isoformat(),
+            "project": target_project,
+            "column": item["status"],
+            "worktree": worktree_path,
+            "branch": branch_name,
+            "item_id": item["item_id"],
+            "issue_repo": item["issue_repo"],
+            "retry_count": retry_info["retry_count"],
+            "title": item["title"],
+            "body": item["body"],
+            "pipeline": retry_info.get("pipeline"),
+            "pipeline_index": retry_info.get("pipeline_index"),
+            "provider": used_provider,
+        }
+        if retry_info.get("parent_issue"):
+            entry["parent_issue"] = retry_info["parent_issue"]
+        state["running"][issue_num] = entry
+        running_count += 1
+        del retry_queue[issue_num]
+        log.info("Retried issue #%s (PID %d, provider: %s)", issue_num, pid, used_provider)
+
+    save_state(state)
+
+
+def phase_poll_and_dispatch(state, config, fields_cache, routes):
+    """Poll the board and dispatch agents for ready issues.
+
+    v3: Budget-aware concurrency, pipeline classification, big-build deferral.
+    """
+    budget = get_budget_profile(config)
+    max_concurrent = budget["max_concurrent"]
+    running_count = len(state["running"])
+
+    # Usage-aware throttling: check actual consumption
+    usage = get_usage_status()
+    if usage["should_pause"]:
+        log.warning("Usage: PAUSED — %s", usage["reason"])
+        return
+    if usage["should_throttle"]:
+        max_concurrent = max(1, max_concurrent - 1)
+        log.info("Usage: throttled to max_concurrent=%d — %s",
+                 max_concurrent, usage["reason"])
+
+    log.info("Budget: %s | window=%s%% (%d/%d output tokens, %d sessions)",
+             get_budget_summary(state), usage["window_pct"],
+             usage["window_output_tokens"], usage["window_output_ceiling"],
+             usage["window_sessions"])
 
     if running_count >= max_concurrent:
         log.info("At max concurrency (%d/%d), skipping poll",
@@ -963,12 +1324,55 @@ def phase_poll_and_dispatch(state, config, fields_cache, routes):
             )
             continue
 
-        # Auto-route from Ready
+        # Skip items in non-dispatchable columns (Done, Review, Stuck, Backlog)
+        non_dispatchable = set(routes.get("non_dispatchable", ["Review", "Review", "Done", "Backlog"]))
+        if item["status"] in non_dispatchable:
+            continue
+
+        # Skip items whose status isn't a known column (safety guard)
+        if item["status"] != "Ready" and item["status"] not in routes["columns"]:
+            log.warning("Issue #%d has unknown status '%s', skipping",
+                        item["issue_number"], item["status"])
+            continue
+
+        # Budget: defer big builds to off-hours
+        if should_defer_issue(item, budget):
+            log.info("Deferring big build issue #%d until aggressive mode",
+                     item["issue_number"])
+            continue
+
+        # Auto-route from Ready with pipeline classification
         if item["status"] == "Ready":
-            target_column = auto_route(item, routes)
-            log.info("Auto-routing issue #%d to %s", item["issue_number"], target_column)
+            # Check if this issue has existing pipeline state (was routed back by Skeptic)
+            pipeline_state = state.get("pipeline_state", {}).get(str(item["issue_number"]))
+            if pipeline_state:
+                pipeline = pipeline_state["pipeline"]
+                pipeline_idx = pipeline_state["pipeline_index"]
+                target_column = pipeline[pipeline_idx] if pipeline_idx < len(pipeline) else "Engineering"
+                log.info("Resuming issue #%d at pipeline[%d]=%s (pipeline: %s)",
+                         item["issue_number"], pipeline_idx, target_column,
+                         " → ".join(pipeline))
+            else:
+                issue_type, pipeline = classify_issue(item["title"], item["body"])
+                target_column = pipeline[0]
+                pipeline_idx = 0
+                log.info("Auto-routing issue #%d as '%s' → pipeline %s",
+                         item["issue_number"], issue_type, " → ".join(pipeline))
+
+            # If pipeline says "Done", close the issue instead of dispatching
+            if target_column == "Done":
+                log.info("Pipeline complete for issue #%d — closing", item["issue_number"])
+                move_issue_to_column(fields_cache, item["item_id"], "Done")
+                repo = item.get("issue_repo", config["github_repo"])
+                gh_issue_close(repo, item["issue_number"])
+                # Clean up pipeline state
+                state.get("pipeline_state", {}).pop(str(item["issue_number"]), None)
+                continue
+
             move_issue_to_column(fields_cache, item["item_id"], target_column)
             item["status"] = target_column
+            item["_pipeline"] = pipeline
+            item["_pipeline_index"] = pipeline_idx
 
         # Validate target project directory
         target_project = item["target_project"]
@@ -985,8 +1389,8 @@ def phase_poll_and_dispatch(state, config, fields_cache, routes):
             continue
         worktree_path, branch_name = result
 
-        # Spawn agent
-        pid = spawn_agent(config, routes, item, worktree_path)
+        # Spawn agent (routes through provider config)
+        pid, used_provider = spawn_for_provider(config, routes, item, worktree_path)
         if pid is None:
             cleanup_worktree(project_dir, item["issue_number"], target_project)
             continue
@@ -1001,7 +1405,14 @@ def phase_poll_and_dispatch(state, config, fields_cache, routes):
             "branch": branch_name,
             "item_id": item["item_id"],
             "issue_repo": item.get("issue_repo", config["github_repo"]),
+            "title": item.get("title", ""),
+            "body": item.get("body", "")[:500],  # truncate for state file size
+            "provider": used_provider,
         }
+        # Store pipeline for smart advancement
+        if item.get("_pipeline"):
+            entry["pipeline"] = item["_pipeline"]
+            entry["pipeline_index"] = item.get("_pipeline_index", 0)
         # Store parent Epic reference so harvest can post progress updates.
         if item.get("parent"):
             entry["parent_issue"] = item["parent"]
@@ -1032,7 +1443,12 @@ def _extract_summary(output_text):
 
 
 def phase_harvest(state, config, fields_cache, routes):
-    """Check for finished agents (completed or crashed) and handle results."""
+    """Check for finished agents and evaluate their output smartly.
+
+    Uses layered evaluation gates (evaluator.py) instead of the old
+    ">50 chars = done" heuristic. Failed evaluations trigger retries
+    with failure context before giving up.
+    """
 
     for issue_num, info in list(state["running"].items()):
         try:
@@ -1041,36 +1457,75 @@ def phase_harvest(state, config, fields_cache, routes):
 
             repo = info.get("issue_repo", config["github_repo"])
             output_file = OUTPUT_DIR / f"{issue_num}.log"
-            output_text = ""
+            stderr_file = OUTPUT_DIR / f"{issue_num}.stderr.log"
+            raw_output = ""
             if output_file.exists():
-                output_text = output_file.read_text()
+                raw_output = output_file.read_text()
 
             project_dir = str(Path(config["projects_root"]) / info.get("project", ""))
 
-            # Distinguish completion from crash: a completed agent produces
-            # meaningful output. A crash produces empty or error-only output.
-            has_meaningful_output = len(output_text.strip()) > 50
+            # Parse JSON output to extract both result text and usage data.
+            # With --output-format json, the output is a JSON object with
+            # "result" (the text) and "usage" (token counts).
+            output_text = raw_output
+            session_usage = {}
+            try:
+                json_output = json.loads(raw_output)
+                output_text = json_output.get("result", raw_output)
+                session_usage = json_output.get("usage", {})
+                session_usage["total_cost_usd"] = json_output.get("total_cost_usd", 0)
+                session_usage["duration_ms"] = json_output.get("duration_ms", 0)
+            except (json.JSONDecodeError, TypeError):
+                # Not JSON — agent may have crashed before producing structured output
+                pass
 
-            if not has_meaningful_output:
-                # Crash — no useful output
-                log.warning("Issue #%s: PID %d exited with no meaningful output (crash)",
-                            issue_num, info["pid"])
-                last_output = output_text[-2000:] if output_text else "(no output)"
+            # Record per-session token usage for rolling window tracking
+            if session_usage:
+                record_session(session_usage, info["agent"], int(issue_num))
+
+            # Track session stats for budget (legacy rolling average)
+            started = datetime.fromisoformat(info["started"])
+            duration_min = (datetime.now(timezone.utc) - started).total_seconds() / 60
+            update_session_stats(state, info["agent"], duration_min, len(output_text))
+
+            log.info("Issue #%s: agent finished (PID %d, %.0f min, provider: %s)",
+                     issue_num, info["pid"], duration_min,
+                     info.get("provider", "claude"))
+
+            # Local provider crash fallback: if the local agent produced no
+            # meaningful output, re-queue the issue to retry with claude.
+            if (info.get("provider") == "local"
+                    and len(output_text.strip()) < 50
+                    and not output_text.strip().startswith("##BLOCKED##")):
+                log.warning("Local agent produced no output for #%s, re-queuing with claude",
+                            issue_num)
                 gh_issue_comment(repo, int(issue_num),
-                    f"**Agent crashed** (PID {info['pid']} exited unexpectedly). "
-                    f"Moving to Review.\n\n"
-                    f"Agent type: `{info['agent']}`\n\n"
-                    f"<details><summary>Last output</summary>\n\n```\n{last_output}\n```\n</details>")
-                move_issue_to_column(fields_cache, info.get("item_id", ""), "Review")
+                    f"**Local agent failed** (empty output) — retrying with Claude.\n\n"
+                    f"Agent type: `{info['agent']}`, Provider: `{info.get('provider')}`")
                 cleanup_worktree(project_dir, int(issue_num), info.get("project"))
+                # Queue for retry with claude — store as retry with forced provider
+                retry_info = {
+                    "retry_count": info.get("retry_count", 0),
+                    "prior_failure": "local_agent_empty_output",
+                    "item_id": info.get("item_id", ""),
+                    "column": info.get("column", ""),
+                    "title": info.get("title", ""),
+                    "body": info.get("body", ""),
+                    "issue_repo": repo,
+                    "target_project": info.get("project", ""),
+                    "parent_issue": info.get("parent_issue"),
+                    "pipeline": info.get("pipeline"),
+                    "pipeline_index": info.get("pipeline_index"),
+                    "force_provider": "claude",
+                }
+                state.setdefault("retry_queue", {})[issue_num] = retry_info
                 output_file.unlink(missing_ok=True)
+                stderr_file.unlink(missing_ok=True)
                 del state["running"][issue_num]
                 save_state(state)
                 continue
 
-            log.info("Issue #%s: agent completed (PID %d)", issue_num, info["pid"])
-
-            # Check for BLOCKED marker
+            # Check for BLOCKED marker first (unchanged behavior)
             blocker = None
             for line in output_text.splitlines():
                 stripped = line.strip()
@@ -1080,9 +1535,8 @@ def phase_harvest(state, config, fields_cache, routes):
                 elif stripped.startswith("BLOCKED:"):
                     blocker = stripped
                     break
-            is_blocked = blocker is not None
 
-            if is_blocked:
+            if blocker:
                 log.info("Issue #%s is blocked: %s", issue_num, blocker)
                 gh_issue_comment(repo, int(issue_num),
                     f"**Agent blocked** — moving to Review.\n\n"
@@ -1090,42 +1544,140 @@ def phase_harvest(state, config, fields_cache, routes):
                     f"Agent type: `{info['agent']}`")
                 move_issue_to_column(fields_cache, info.get("item_id", ""), "Review")
                 cleanup_worktree(project_dir, int(issue_num), info.get("project"))
-                # Notify parent Epic that a sub-issue is blocked.
-                if info.get("parent_issue"):
-                    parent_num = info["parent_issue"]["number"]
-                    parent_repo = info["parent_issue"].get("repo", repo)
-                    summary = fetch_epic_summary(parent_repo, parent_num)
-                    progress = (
-                        f"{summary['completed']}/{summary['total']}"
-                        if summary else "?"
-                    )
-                    gh_issue_comment(parent_repo, parent_num,
-                        f"📋 **Sub-issue #{issue_num} blocked** — Epic progress: {progress}.\n\n"
-                        f"`{blocker}`")
-                    log.info("Epic #%d: sub-issue #%s blocked, notified",
-                             parent_num, issue_num)
+                _notify_epic_blocked(info, issue_num, blocker, repo, config)
+                output_file.unlink(missing_ok=True)
+                stderr_file.unlink(missing_ok=True)
+                del state["running"][issue_num]
+                save_state(state)
+                continue
+
+            # --- Smart Evaluation ---
+            # Build a minimal item dict for the evaluator
+            eval_item = {
+                "title": info.get("title", ""),
+                "body": info.get("body", ""),
+            }
+            eval_result, eval_reason = evaluate(
+                output_text, eval_item, info, config, CLAUDE_BIN
+            )
+            log.info("Issue #%s evaluation: %s — %s", issue_num, eval_result, eval_reason)
+
+            if eval_result == "fail_retry":
+                retry_count = info.get("retry_count", 0)
+                max_retries = config.get("evaluation", {}).get("max_retries", 2)
+                log.warning("Issue #%s failed evaluation (retry %d/%d): %s",
+                            issue_num, retry_count + 1, max_retries, eval_reason)
+                gh_issue_comment(repo, int(issue_num),
+                    f"**Evaluation failed** (attempt {retry_count + 1}/{max_retries}): "
+                    f"{eval_reason}\n\nRetrying with failure context.")
+
+                # Queue for retry — store failure context, clean worktree, re-dispatch next cycle
+                retry_info = {
+                    "retry_count": retry_count + 1,
+                    "prior_failure": eval_reason,
+                    "item_id": info.get("item_id", ""),
+                    "column": info.get("column", ""),
+                    "title": info.get("title", ""),
+                    "body": info.get("body", ""),
+                    "issue_repo": repo,
+                    "target_project": info.get("project", ""),
+                    "parent_issue": info.get("parent_issue"),
+                    "pipeline": info.get("pipeline"),
+                    "pipeline_index": info.get("pipeline_index"),
+                }
+                state.setdefault("retry_queue", {})[issue_num] = retry_info
+                cleanup_worktree(project_dir, int(issue_num), info.get("project"))
+                output_file.unlink(missing_ok=True)
+                stderr_file.unlink(missing_ok=True)
+                del state["running"][issue_num]
+                save_state(state)
+                continue
+
+            if eval_result == "fail_stuck":
+                log.warning("Issue #%s permanently stuck: %s", issue_num, eval_reason)
+                last_output = output_text[-1500:] if output_text else "(no output)"
+                gh_issue_comment(repo, int(issue_num),
+                    f"**Agent failed evaluation** — moving to Stuck.\n\n"
+                    f"**Reason:** {eval_reason}\n"
+                    f"**Retries exhausted:** {info.get('retry_count', 0)} attempts\n\n"
+                    f"<details><summary>Last output</summary>\n\n```\n{last_output}\n```\n</details>")
+                move_issue_to_column(fields_cache, info.get("item_id", ""), "Review")
+                cleanup_worktree(project_dir, int(issue_num), info.get("project"))
+                output_file.unlink(missing_ok=True)
+                stderr_file.unlink(missing_ok=True)
+                del state["running"][issue_num]
+                save_state(state)
+                continue
+
+            # --- Evaluation passed: merge and advance ---
+            merge_ok, merge_error = merge_worktree(project_dir, info.get("branch", ""))
+
+            if not merge_ok:
+                log.warning("Merge conflict for issue #%s, moving to Review", issue_num)
+                gh_issue_comment(repo, int(issue_num),
+                    f"**Merge conflict** — moving to Review.\n\n"
+                    f"Branch `{info.get('branch', '')}` preserved for manual merging.\n\n"
+                    f"Agent type: `{info['agent']}`\n"
+                    f"Error: `{merge_error}`")
+                move_issue_to_column(fields_cache, info.get("item_id", ""), "Review")
             else:
-                # Attempt merge
-                merge_ok, merge_error = merge_worktree(project_dir, info.get("branch", ""))
+                # --- Skeptic routing: the Skeptic decides where work goes ---
+                if info.get("column") == "Skeptic":
+                    verdict = extract_verdict(output_text)
+                    if verdict:
+                        decision = verdict.get("DECISION", "").upper()
+                        route = verdict.get("ROUTE", "").strip()
+                        reason = verdict.get("REASON", "no reason given")
+                        issues_created = verdict.get("ISSUES_CREATED", "none")
 
-                if not merge_ok:
-                    log.warning("Merge conflict for issue #%s, moving to Review", issue_num)
-                    gh_issue_comment(repo, int(issue_num),
-                        f"**Merge conflict** — moving to Review.\n\n"
-                        f"Branch `{info.get('branch', '')}` preserved for manual merging.\n\n"
-                        f"Agent type: `{info['agent']}`\n"
-                        f"Error: `{merge_error}`")
-                    move_issue_to_column(fields_cache, info.get("item_id", ""), "Review")
-                    # Don't clean up worktree on merge conflict — preserve for manual merge
+                        # Validate route is a real column
+                        valid_columns = set(routes["columns"].keys()) | {"Ready", "Done", "Review", "Review"}
+                        if route not in valid_columns:
+                            route = "Review"  # fallback if Skeptic gives bad route
+                            log.warning("Skeptic gave invalid route '%s', falling back to Review",
+                                        verdict.get("ROUTE", ""))
+
+                        if decision == "APPROVE":
+                            next_column = route
+                            log.info("Skeptic APPROVED #%s → %s: %s", issue_num, route, reason)
+                        else:
+                            next_column = route
+                            log.info("Skeptic REJECTED #%s → %s: %s", issue_num, route, reason)
+
+                        comment_body = (
+                            f"**Skeptic verdict: {decision}** → **{next_column}**\n\n"
+                            f"**Reason:** {reason}\n\n"
+                        )
+                        if issues_created and issues_created.lower() != "none":
+                            comment_body += f"**Issues created:** {issues_created}\n\n"
+
+                        # Append raw verdict for transparency
+                        raw = output_text[-1500:] if len(output_text) > 1500 else output_text
+                        comment_body += (
+                            f"<details><summary>Full verdict</summary>\n\n"
+                            f"```\n{raw}\n```\n</details>"
+                        )
+                    else:
+                        # Skeptic didn't produce a verdict — treat as rejection to Review
+                        next_column = "Review"
+                        comment_body = (
+                            f"**Skeptic** completed but produced no verdict. "
+                            f"Moving to **Review** for human inspection.\n\n"
+                        )
+                        log.warning("Skeptic #%s: no verdict found in output", issue_num)
                 else:
-                    # Success — post summary, advance to next column
-                    next_column = routes["columns"].get(info["column"], {}).get("next", "Done")
+                    # --- Normal agents: advance through pipeline ---
+                    pipeline = info.get("pipeline")
+                    pipeline_idx = info.get("pipeline_index", 0)
+                    if pipeline and pipeline_idx + 1 < len(pipeline):
+                        next_column = pipeline[pipeline_idx + 1]
+                    else:
+                        next_column = routes["columns"].get(info["column"], {}).get("next", "Done")
 
-                    # Extract ##SUMMARY## block for the visible comment
-                    structured = _extract_summary(output_text)
+                    structured = eval_extract_summary(output_text)
                     if structured:
                         comment_body = (
-                            f"**{info['agent']}** completed.\n\n"
+                            f"**{info['agent']}** completed. ✅ Evaluation passed.\n\n"
                             f"**What was done:** {structured.get('DONE', '(see output)')}\n\n"
                             f"**Files changed:** {structured.get('FILES', 'none listed')}\n\n"
                             f"**Commits:** {structured.get('COMMITS', 'none listed')}\n\n"
@@ -1135,55 +1687,107 @@ def phase_harvest(state, config, fields_cache, routes):
                             comment_body += f"**Follow-up needed:** {followup}\n\n"
                         comment_body += f"Moving to **{next_column}**."
                     else:
-                        # No structured summary — truncate raw output
                         raw = output_text[-2000:] if len(output_text) > 2000 else output_text
                         comment_body = (
-                            f"**{info['agent']}** completed.\n\n"
+                            f"**{info['agent']}** completed. ✅ Evaluation passed.\n\n"
                             f"<details><summary>Agent output</summary>\n\n"
                             f"```\n{raw}\n```\n</details>\n\n"
                             f"Moving to **{next_column}**."
                         )
-                    gh_issue_comment(repo, int(issue_num), comment_body)
 
-                    if next_column == "Done":
-                        move_issue_to_column(fields_cache, info.get("item_id", ""), "Done")
-                        gh_issue_close(repo, int(issue_num))
-                    else:
-                        move_issue_to_column(fields_cache, info.get("item_id", ""), next_column)
+                gh_issue_comment(repo, int(issue_num), comment_body)
 
-                    cleanup_worktree(project_dir, int(issue_num), info.get("project"))
+                if next_column == "Done":
+                    move_issue_to_column(fields_cache, info.get("item_id", ""), "Done")
+                    gh_issue_close(repo, int(issue_num))
+                else:
+                    move_issue_to_column(fields_cache, info.get("item_id", ""), next_column)
 
-                    # Epic progress tracking: post update on parent when a
-                    # sub-issue completes; auto-close Epic when all are done.
-                    if info.get("parent_issue"):
-                        parent_num = info["parent_issue"]["number"]
-                        parent_repo = info["parent_issue"].get("repo", repo)
-                        summary = fetch_epic_summary(parent_repo, parent_num)
-                        if summary and summary["total"] > 0:
-                            progress = f"{summary['completed']}/{summary['total']}"
-                            percent = summary["percent_completed"]
-                            if summary["completed"] == summary["total"]:
-                                gh_issue_comment(parent_repo, parent_num,
-                                    f"🎉 **Epic complete** — all {summary['total']} "
-                                    f"sub-issues resolved.\n\n"
-                                    f"Closing this Epic automatically.")
-                                gh_issue_close(parent_repo, parent_num)
-                                log.info("Epic #%d: all sub-issues complete, auto-closed",
-                                         parent_num)
-                            else:
-                                gh_issue_comment(parent_repo, parent_num,
-                                    f"📊 **Progress update** — sub-issue #{issue_num} "
-                                    f"completed.\n\n"
-                                    f"**{progress}** sub-issues done ({percent}% complete).")
-                                log.info("Epic #%d: progress %s (%d%%)",
-                                         parent_num, progress, percent)
+                # Update pipeline index if using pipeline routing.
+                # Find the target column nearest to (but not before) current position
+                # to handle duplicate column names (e.g., Skeptic appears 3x in feature).
+                # If Skeptic routes to Ready, preserve pipeline state so we resume correctly.
+                pipeline = info.get("pipeline")
+                if pipeline:
+                    current_idx = info.get("pipeline_index", 0)
+                    if next_column in pipeline:
+                        # Find nearest occurrence at or after current position
+                        new_idx = None
+                        for i in range(len(pipeline)):
+                            if pipeline[i] == next_column:
+                                if i >= current_idx:
+                                    new_idx = i
+                                    break
+                        # If not found forward, take the last occurrence before current
+                        # (Skeptic routing backward is intentional)
+                        if new_idx is None:
+                            for i in range(len(pipeline) - 1, -1, -1):
+                                if pipeline[i] == next_column:
+                                    new_idx = i
+                                    break
+                        if new_idx is not None:
+                            state.setdefault("pipeline_state", {})[issue_num] = {
+                                "pipeline": pipeline,
+                                "pipeline_index": new_idx,
+                            }
+                    elif next_column == "Ready":
+                        # Skeptic sent to Ready — preserve pipeline at current position
+                        # so we resume where we left off, not restart from scratch
+                        state.setdefault("pipeline_state", {})[issue_num] = {
+                            "pipeline": pipeline,
+                            "pipeline_index": current_idx,
+                        }
+
+                cleanup_worktree(project_dir, int(issue_num), info.get("project"))
+
+                # Epic progress tracking
+                _notify_epic_progress(info, issue_num, repo)
 
             output_file.unlink(missing_ok=True)
+            stderr_file.unlink(missing_ok=True)
             del state["running"][issue_num]
             save_state(state)
         except Exception:
             log.exception("Error harvesting issue #%s, skipping", issue_num)
             continue
+
+
+def _notify_epic_blocked(info, issue_num, blocker, repo, config):
+    """Notify parent Epic that a sub-issue is blocked."""
+    if not info.get("parent_issue"):
+        return
+    parent_num = info["parent_issue"]["number"]
+    parent_repo = info["parent_issue"].get("repo", repo)
+    summary = fetch_epic_summary(parent_repo, parent_num)
+    progress = f"{summary['completed']}/{summary['total']}" if summary else "?"
+    gh_issue_comment(parent_repo, parent_num,
+        f"📋 **Sub-issue #{issue_num} blocked** — Epic progress: {progress}.\n\n"
+        f"`{blocker}`")
+    log.info("Epic #%d: sub-issue #%s blocked, notified", parent_num, issue_num)
+
+
+def _notify_epic_progress(info, issue_num, repo):
+    """Post Epic progress update and auto-close if all sub-issues done."""
+    if not info.get("parent_issue"):
+        return
+    parent_num = info["parent_issue"]["number"]
+    parent_repo = info["parent_issue"].get("repo", repo)
+    summary = fetch_epic_summary(parent_repo, parent_num)
+    if not summary or summary["total"] == 0:
+        return
+    progress = f"{summary['completed']}/{summary['total']}"
+    percent = summary["percent_completed"]
+    if summary["completed"] == summary["total"]:
+        gh_issue_comment(parent_repo, parent_num,
+            f"🎉 **Epic complete** — all {summary['total']} sub-issues resolved.\n\n"
+            f"Closing this Epic automatically.")
+        gh_issue_close(parent_repo, parent_num)
+        log.info("Epic #%d: all sub-issues complete, auto-closed", parent_num)
+    else:
+        gh_issue_comment(parent_repo, parent_num,
+            f"📊 **Progress update** — sub-issue #{issue_num} completed.\n\n"
+            f"**{progress}** sub-issues done ({percent}% complete).")
+        log.info("Epic #%d: progress %s (%d%%)", parent_num, progress, percent)
 
 
 # ---------------------------------------------------------------------------
@@ -1257,6 +1861,95 @@ def cleanup_orphans(state, config):
                         )
 
 
+def _fix_board_orphans(config, fields_cache):
+    """Fix board items with no status or stuck in Stuck — move to Ready.
+
+    Also moves CLOSED items out of Ready to Done.
+    Runs every cycle to prevent items from falling into limbo.
+    """
+    owner = config["github_repo"].split("/")[0]
+    project_num = config["github_project_number"]
+    project_id = fields_cache["project_id"]
+    field_id = fields_cache["fields"]["Status"]["id"]
+    ready_id = fields_cache["fields"]["Status"]["options"].get("Ready")
+    done_id = fields_cache["fields"]["Status"]["options"].get("Done")
+
+    if not ready_id or not done_id:
+        return
+
+    query = f'''query {{
+        user(login: "{owner}") {{
+            projectV2(number: {project_num}) {{
+                items(first: 100) {{
+                    nodes {{
+                        id
+                        content {{
+                            ... on Issue {{ number state title }}
+                        }}
+                        fieldValues(first: 15) {{
+                            nodes {{
+                                ... on ProjectV2ItemFieldSingleSelectValue {{
+                                    name
+                                    field {{ ... on ProjectV2SingleSelectField {{ name }} }}
+                                }}
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+        }}
+    }}'''
+
+    data = gh_graphql(query)
+    if not data:
+        return
+
+    fixed = 0
+    for node in data["data"]["user"]["projectV2"]["items"]["nodes"]:
+        content = node.get("content")
+        if not content:
+            continue
+        issue_state = content.get("state", "OPEN")
+        status = None
+        for fv in node.get("fieldValues", {}).get("nodes", []):
+            field = fv.get("field", {})
+            if field.get("name") == "Status" and "name" in fv:
+                status = fv["name"]
+
+        target = None
+        title = content.get("title", "")
+        backlog_id = fields_cache["fields"]["Status"]["options"].get("Backlog")
+
+        if issue_state == "CLOSED" and status not in ("Done", None):
+            # Closed but not in Done — fix immediately
+            target = done_id
+        elif issue_state == "OPEN" and status is None:
+            # No status. Epics go to Backlog (they're containers, not dispatchable).
+            is_epic = title.startswith("Let's ") or title.startswith("Epic:")
+            target = backlog_id if (is_epic and backlog_id) else ready_id
+        elif issue_state == "OPEN" and status == "Review":
+            # Only move non-interview/review items back to Ready
+            if not (title.startswith("[Interview]") or title.startswith("[Review]")):
+                target = ready_id
+        # [Interview] issues in Review stay there — they need human input
+
+        if target:
+            mutation = f'''mutation {{
+                updateProjectV2ItemFieldValue(input: {{
+                    projectId: "{project_id}"
+                    itemId: "{node['id']}"
+                    fieldId: "{field_id}"
+                    value: {{ singleSelectOptionId: "{target}" }}
+                }}) {{ projectV2Item {{ id }} }}
+            }}'''
+            result = gh_graphql(mutation)
+            if result:
+                fixed += 1
+
+    if fixed:
+        log.info("Board hygiene: fixed %d orphaned items", fixed)
+
+
 def validate_environment():
     """Fail fast if critical dependencies are missing or misconfigured."""
     errors = []
@@ -1312,6 +2005,12 @@ def main():
 
         cleanup_orphans(state, config)
 
+        # Prune old session log entries (keep 14 days)
+        try:
+            prune_session_log()
+        except Exception:
+            pass
+
         fields_cache = get_project_fields(config)
         if not fields_cache:
             log.error("Cannot fetch project fields, aborting")
@@ -1325,13 +2024,32 @@ def main():
         phase_harvest(state, config, fields_cache, routes)
         save_state(state)
 
-        # Phase 4: Poll and dispatch
+        # Phase 4: Process retry queue (re-dispatch failed evaluations)
+        phase_retry_queue(state, config, fields_cache, routes)
+        save_state(state)
+
+        # Phase 5: Board hygiene — fix orphaned items (None/Stuck → Ready)
+        if not DRY_RUN:
+            _fix_board_orphans(config, fields_cache)
+
+        # Phase 6: Discover work when queue is empty
+        phase_discover(state, config, fields_cache, dry_run=DRY_RUN)
+        save_state(state)
+
+        # Phase 7: Poll and dispatch
         phase_poll_and_dispatch(state, config, fields_cache, routes)
         state["last_poll"] = datetime.now(timezone.utc).isoformat()
         save_state(state)
 
-        log.info("Dispatcher cycle complete. Running: %d agents",
-                 len(state["running"]))
+        # Save usage snapshot every cycle
+        try:
+            save_snapshot()
+        except Exception:
+            log.debug("Failed to save usage snapshot (non-critical)")
+
+        budget_summary = get_budget_summary(state)
+        log.info("Dispatcher cycle complete. Running: %d agents. %s",
+                 len(state["running"]), budget_summary)
     except Exception:
         log.exception("Dispatcher error")
         if state is not None:

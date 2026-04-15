@@ -779,11 +779,10 @@
 
         // Classify status category
         let statusCategory = 'other';
-        if (status.includes('\uD83D\uDFE2') || status.toLowerCase().includes('active')) statusCategory = 'active';
-        else if (status.includes('\u2705') || status.toLowerCase().includes('complete') || status.toLowerCase().includes('live') || status.toLowerCase().includes('testflight')) statusCategory = 'complete';
-        else if (status.includes('\uD83D\uDEA7') || status.includes('\uD83D\uDFE1') || status.toLowerCase().includes('in progress') || status.toLowerCase().includes('mostly complete')) statusCategory = 'in-progress';
-        else if (status.includes('\uD83D\uDCA4') || status.toLowerCase().includes('on hold') || status.toLowerCase().includes('hold') || status.toLowerCase().includes('paused')) statusCategory = 'on-hold';
-        else if (status.includes('\uD83D\uDDC4') || status.toLowerCase().includes('archived')) statusCategory = 'archived';
+        const sl = status.toLowerCase();
+        if (sl.includes('active')) statusCategory = 'active';
+        else if (sl.includes('on hold') || sl.includes('hold') || sl.includes('paused')) statusCategory = 'on-hold';
+        else if (sl.includes('done') || sl.includes('complete') || sl.includes('archived')) statusCategory = 'done';
 
         const description = descLines.join(' ').trim();
         const extras = extraLines.filter(l => l.trim()).join('\n').trim();
@@ -841,7 +840,7 @@
       const el = document.getElementById('agents');
       const running = st && st.running ? st.running : {};
       const keys = Object.keys(running);
-      const repo = cfg ? cfg.github_repo : 'your-username/your-repo';
+      const repo = cfg ? cfg.github_repo : 'youruser/half-bakery';
 
       let html = '<div class="section-title">Running Agents <span class="section-count">(' + keys.length + ')</span></div>';
 
@@ -911,7 +910,7 @@
       const el = document.getElementById('projects');
 
       // Count by category
-      const counts = { all: projs.length, active: 0, complete: 0, 'in-progress': 0, 'on-hold': 0, archived: 0, other: 0 };
+      const counts = { all: projs.length, active: 0, done: 0, 'on-hold': 0, other: 0 };
       for (const p of projs) {
         if (counts[p.statusCategory] !== undefined) counts[p.statusCategory]++;
         else counts.other++;
@@ -937,9 +936,8 @@
         ['all', 'All'],
         ['active', 'Active'],
         ['in-progress', 'In Progress'],
-        ['complete', 'Complete'],
         ['on-hold', 'On Hold'],
-        ['archived', 'Archived']
+        ['done', 'Done']
       ];
 
       let html = '<div class="section-title">Projects <span class="section-count">(' + filtered.length + ')</span></div>';
@@ -963,9 +961,7 @@
           html += `<div class="project-parse-error">Parse error for project #${p.number}</div>`;
         }
 
-        html += `<div class="project-name">`;
-        if (p.emoji) html += `<span class="emoji">${p.emoji}</span>`;
-        html += `${esc(p.name)}</div>`;
+        html += `<div class="project-name">${esc(p.name)}</div>`;
 
         if (p.status) {
           html += `<div class="project-status">${esc(p.status)}</div>`;
@@ -1053,43 +1049,32 @@
         return;
       }
 
-      let html = '<div class="section-title">Pipeline Routes</div>';
+      let html = '<div class="section-title">Pipeline Templates</div>';
 
-      // Main flow: Ready -> Engineering -> QA -> Docs -> Done
-      html += '<div class="pipeline-main">';
-      html += '<span class="pipeline-node node-ready">Ready</span>';
-      html += '<span class="pipeline-arrow">\u2192</span>';
-      html += '<span class="pipeline-node node-engineering">Engineering</span>';
-      html += '<span class="pipeline-arrow">\u2192</span>';
-      html += '<span class="pipeline-node node-qa">QA</span>';
-      html += '<span class="pipeline-arrow">\u2192</span>';
-      html += '<span class="pipeline-node node-docs">Docs</span>';
-      html += '<span class="pipeline-arrow">\u2192</span>';
-      html += '<span class="pipeline-node node-done">Done</span>';
+      // Render pipeline templates from config (dynamic, not hardcoded)
+      const templates = cfg.pipeline_templates || {};
+      if (Object.keys(templates).length > 0) {
+        for (const [type, steps] of Object.entries(templates)) {
+          html += '<div style="margin-bottom:8px">';
+          html += '<span style="color:var(--text-muted);font-size:11px;min-width:90px;display:inline-block">' + esc(type) + ':</span> ';
+          for (let i = 0; i < steps.length; i++) {
+            const step = steps[i];
+            const cls = 'node-' + step.toLowerCase().replace(/\s+/g, '-');
+            html += '<span class="pipeline-node ' + cls + '" style="font-size:11px;padding:2px 8px">' + esc(step) + '</span>';
+            if (i < steps.length - 1) html += '<span class="pipeline-arrow" style="font-size:10px">\u2192</span>';
+          }
+          html += '</div>';
+        }
+      }
+
+      // Column routes with agents
+      html += '<div style="margin-top:12px"><span class="route-label">Agent assignments:</span><br>';
+      for (const [col, info] of Object.entries(cfg.columns || {})) {
+        const cls = 'node-' + col.toLowerCase().replace(/\s+/g, '-');
+        html += '<span class="pipeline-node ' + cls + '" style="font-size:12px;padding:3px 10px">' + esc(col) + '</span>';
+        html += ' <span style="color:var(--text-muted);font-size:11px">(' + esc(info.agent) + ' \u2192 ' + esc(info.next) + ')</span><br>';
+      }
       html += '</div>';
-
-      // Alternate routes
-      const altRoutes = [];
-      const mainFlow = ['Engineering', 'QA', 'Docs'];
-      for (const [col, info] of Object.entries(cfg.columns)) {
-        if (!mainFlow.includes(col)) {
-          altRoutes.push({ from: col, agent: info.agent, to: info.next });
-        }
-      }
-
-      if (altRoutes.length > 0) {
-        html += '<div class="pipeline-alt">';
-        html += '<span class="route-label">Alternate routes:</span><br>';
-        for (const r of altRoutes) {
-          const fromCls = 'node-' + r.from.toLowerCase().replace(/\s+/g, '-');
-          const toCls   = 'node-' + r.to.toLowerCase().replace(/\s+/g, '-');
-          html += '<span class="pipeline-node ' + fromCls + '" style="font-size:12px;padding:3px 10px">' + esc(r.from) + '</span>';
-          html += ' <span style="color:var(--text-muted);font-size:11px">(' + esc(r.agent) + ')</span> ';
-          html += '<span class="pipeline-arrow">\u2192</span> ';
-          html += '<span class="pipeline-node ' + toCls + '" style="font-size:12px;padding:3px 10px">' + esc(r.to) + '</span><br>';
-        }
-        html += '</div>';
-      }
 
       el.innerHTML = html;
     }

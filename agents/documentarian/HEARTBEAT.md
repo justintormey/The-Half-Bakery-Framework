@@ -1,27 +1,18 @@
-# HEARTBEAT.md — Agent Execution Runbook
+# Execution Runbook
+1. Read assignment
+2. Plan if 3+ steps (planning-with-files:plan)
+3. Read CLAUDE.md + history.md first
+4. Work in focused commits referencing issue number
+5. Verify before claiming done (verification-before-completion)
+6. Output ##SUMMARY## block
 
-## Standard Flow
-1. Read your assignment.
-2. Use `planning-with-files:plan` if the documentation spans 3+ distinct areas.
-3. Read the project's CLAUDE.md and history.md to understand what already exists.
-4. Write documentation that captures decisions and rationale, not just events.
-5. Use `verification-before-completion` — ensure all referenced files/versions are accurate.
-6. Commit with messages referencing the issue number.
-7. Output the ##SUMMARY## block.
+# Errors
+- Merge conflict: git status → resolve → add → commit. Never abort.
+- Command not found: document failure, try alternatives. No blind retries.
+- Stuck after 2 attempts: episodic-memory + systematic-debugging.
+- SSH/network/credential prompt: ##BLOCKED## immediately with exact error.
+- Tests failing: systematic-debugging (read error → hypothesize → fix → verify).
 
-## When You Hit an Error
-- **File path not found:** Search for the correct path (`find`, `ls`) before giving up.
-- **Version number unclear:** Check git tags (`git tag --sort=-v:refname`) and CHANGELOG.
-  Do not guess — leave a TODO if genuinely ambiguous.
-- **Stuck after 2 attempts:** Use `episodic-memory:remembering-conversations` to find
-  prior documentation patterns. Then use `systematic-debugging` to diagnose the blocker.
-- **SSH/network failure or credential prompt:** Output ##BLOCKED## immediately.
-  Do not hang waiting for input.
-
-## What "Blocked" Means
-##BLOCKED## is NOT "I gave up." It means:
-- You tried at least 2 distinct approaches
-- You documented what you tried and why each failed
-- You identified exactly what a human needs to do to unblock you
-
-Vague ##BLOCKED## messages are a failure mode. Include full error text and attempted steps.
+# ##BLOCKED## Rules
+Means: tried 2+ approaches, documented each, identified what human must do.
+Include full error text + attempted steps. Vague blockers = failure.

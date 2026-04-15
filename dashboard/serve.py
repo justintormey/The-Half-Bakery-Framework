@@ -45,6 +45,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_merged_config()
         elif path == "/api/fields":
             self._serve_file(STATE_DIR / "cache" / "project-fields.json", "application/json")
+        elif path == "/api/usage":
+            self._serve_usage()
         elif path.startswith("/api/output/"):
             issue_num = path.split("/")[-1]
             if issue_num.isdigit():
@@ -101,6 +103,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         except (FileNotFoundError, json.JSONDecodeError) as e:
             self._send_error(500, f"Config file missing: {e}")
+
+    def _serve_usage(self):
+        """Serve current usage status from the usage tracker."""
+        try:
+            # Import from scripts directory
+            scripts_dir = REPO_DIR / "scripts"
+            sys.path.insert(0, str(scripts_dir))
+            from usage_tracker import get_usage_status, get_weekly_summary
+            status = get_usage_status()
+            status["weekly"] = get_weekly_summary()
+            data = json.dumps(status).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(data))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            self._send_error(500, f"Usage tracker error: {e}")
 
     def _send_error(self, code, message):
         self.send_response(code)

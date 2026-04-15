@@ -1,31 +1,18 @@
-# HEARTBEAT.md — Agent Execution Runbook
+# Execution Runbook
+1. Read assignment
+2. Plan if 3+ steps (planning-with-files:plan)
+3. Read CLAUDE.md + history.md first
+4. Work in focused commits referencing issue number
+5. Verify before claiming done (verification-before-completion)
+6. Output ##SUMMARY## block
 
-## Standard Flow
-1. Read your assignment.
-2. Use `planning-with-files:plan` if the task has 3+ distinct steps.
-3. Read the project's CLAUDE.md and history.md before touching code.
-4. Do the work in focused, committed increments.
-5. Use `verification-before-completion` before claiming done.
-6. Commit with messages referencing the issue number.
-7. Output the ##SUMMARY## block.
+# Errors
+- Merge conflict: git status → resolve → add → commit. Never abort.
+- Command not found: document failure, try alternatives. No blind retries.
+- Stuck after 2 attempts: episodic-memory + systematic-debugging.
+- SSH/network/credential prompt: ##BLOCKED## immediately with exact error.
+- Tests failing: systematic-debugging (read error → hypothesize → fix → verify).
 
-## When You Hit an Error
-- **Git merge conflict:** `git status` to see conflicting files. Resolve by keeping the
-  correct version, `git add`, `git commit`. Do not abort the merge.
-- **Command not found / tool missing:** Document exactly what failed.
-  Check if there's an alternative path (e.g., different binary name, pip install).
-  Do not retry the identical command 5 times.
-- **Unexpected file state:** Read what's there before overwriting. Use `git diff`.
-- **Stuck after 2 attempts:** Use `episodic-memory:remembering-conversations` to search
-  for how this was solved before. Then use `systematic-debugging` to diagnose root cause.
-- **SSH/network failure or credential prompt:** Output ##BLOCKED## immediately with
-  the exact error. Do not hang waiting for input that will never arrive.
-- **Tests failing:** Use `systematic-debugging` — read the error, hypothesize, fix, verify.
-
-## What "Blocked" Means
-##BLOCKED## is NOT "I gave up." It means:
-- You tried at least 2 distinct approaches
-- You documented what you tried and why each failed
-- You identified exactly what a human needs to do to unblock you
-
-Vague ##BLOCKED## messages are a failure mode. Include full error text and attempted steps.
+# ##BLOCKED## Rules
+Means: tried 2+ approaches, documented each, identified what human must do.
+Include full error text + attempted steps. Vague blockers = failure.

@@ -1,11 +1,61 @@
 {
   "max_concurrent": 3,
   "agent_timeout_minutes": 45,
-  "projects_root": "~/projects",
-  "agents_root": "~/half-bakery-framework/agents",
-  "github_repo": "your-username/your-repo",
+  "projects_root": "~/Documents/PROJECTS",
+  "agents_root": "~/Documents/PROJECTS/half-bakery/agents",
+  "github_repo": "youruser/half-bakery",
   "github_project_number": 1,
   "state_dir": "~/.half-bakery",
   "claude_permission_mode": "bypassPermissions",
-  "spanning_projects": []
+  "spanning_projects": ["half-bakery"],
+  "default_provider": "claude",
+  "providers": {
+    "claude": {
+      "type": "anthropic"
+    },
+    "local": {
+      "type": "local",
+      "base_url": "http://YOUR_LOCAL_LLM_IP:8080/v1",
+      "model": "qwen3-coder",
+      "ctx_size": 65536,
+      "max_turns": 50,
+      "fallback_provider": "claude"
+    }
+  },
+  "agent_models": {
+    "founding-engineer": "sonnet",
+    "architect": "sonnet",
+    "research-analyst": "sonnet",
+    "skeptic": "sonnet",
+    "qa": "sonnet",
+    "documentarian": "sonnet"
+  },
+  "budget": {
+    "work_hours": {"start": 9, "end": 18},
+    "work_days": [0, 1, 2, 3, 4],
+    "conservative_max": 1,
+    "moderate_max": 1,
+    "aggressive_max": 4,
+    "reserve_pct_work_hours": 40,
+    "reserve_pct_shoulder": 20
+  },
+  "evaluation": {
+    "max_retries": 2,
+    "run_tests": true,
+    "llm_spot_check": false
+  },
+  "discovery": {
+    "enabled": true,
+    "max_issues_per_cycle": 3,
+    "cooldown_days": 7,
+    "scan_todos": true,
+    "scan_deps": true,
+    "scan_security": true,
+    "scan_gaps": true,
+    "scan_vision": true,
+    "vision_cooldown_days": 1
+  },
+  "test_commands": {
+    "default": null
+  }
 }

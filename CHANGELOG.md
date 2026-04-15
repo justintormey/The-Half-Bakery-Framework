@@ -6,6 +6,76 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
+## [2.0.0] — 2026-04-15
+
+### Summary
+
+Major release: Smart Dispatcher v3 with evaluation gates, Skeptic agent, proactive work discovery, usage-aware scheduling, and local deployment module. This is a significant evolution from the v1.x "dispatch and hope" model to a verified, budget-aware, self-improving system.
+
+---
+
+### 🧠 Smart Evaluation (evaluator.py — NEW)
+- 6-gate layered evaluation: output exists → summary block → git diff → scope match → test suite → optional LLM spot-check
+- Zero tokens for first 5 gates; LLM gate only on retries
+- Failed evaluations retry with failure context (max 2), then move to Review
+- Column-specific gate configuration (Engineering gets all gates, Research/QA get lighter checks)
+- Pipeline classification: issues auto-classified as bug/feature/research/architecture/chore/docs/polish with tailored pipelines
+
+### 🔍 Skeptic Agent (agents/skeptic/ — NEW)
+- Verification gate agent that trusts nothing and verifies everything
+- Reads actual git diffs, runs tests, compares deliverables against issue requirements
+- Can APPROVE (advance), REJECT (send back with feedback), or create new issues for gaps found
+- Routes work to any column: Ready, Engineering, Research, Architecture, QA, Done
+- Outputs structured ##VERDICT## block parsed by the dispatcher
+
+### 🔎 Proactive Work Discovery (discoverer.py — NEW)
+- Scans repos for TODO/FIXME comments, outdated deps, security vulnerabilities, quality gaps
+- Vision-driven discovery: reads project-visions.md and generates issues for unstarted deliverables
+- Interview questions: creates [Interview] issues for product owner decisions, routed to Review
+- Orphan rescue: finds open GitHub issues not on the project board and adds them
+- Board hygiene: fixes items with no status, moves closed items to Done
+- Backlog → Ready promotion when queue is empty
+
+### 💰 Usage Budgeting (budget.py, usage_tracker.py — NEW)
+- Time-of-day scheduling: conservative during work hours, aggressive evenings/weekends
+- 5-hour rolling window tracking from per-session token counts
+- Weekly ceiling tracking with throttle and pause thresholds
+- Per-agent model selection (Opus for complex work, Sonnet for review/docs)
+- 429 rate limit detection from debug logs as emergency circuit breaker
+
+### 🚀 Local Deployment (deployer.py — NEW)
+- Replaces GitHub Actions deploy workflows with local S3 sync
+- `.local/` directory pattern: PII, secrets, and deploy config stay gitignored
+- Overlay system: merge local config into clean staging directory before deploy
+- CloudFront invalidation after sync
+- `deploy-targets.json` configuration for all projects
+
+### 🔄 Pipeline & Routing
+- Smart pipeline templates: bugs skip Docs, chores skip QA, features get full chain with Skeptic gates
+- Skeptic verdict routing: agents can send work to any column based on review
+- Pipeline state preservation: issues resume where they left off after Skeptic rerouting
+- Epic/sub-issue support: epics go to Backlog, sub-issues dispatch independently
+- Board pagination: handles projects with 100+ board items
+
+### 📋 Agent Improvements
+- All agent personas compressed ~50% (caveman-style input reduction)
+- "Terse. No filler. Execute before explaining." output style
+- Agents instructed to write ALL output in their project's repo, never in half-bakery
+- Retry context injection: failed agents get specific feedback on what went wrong
+
+### 🏗️ Infrastructure
+- Configurable `--model` flag per agent type
+- Local LLM provider with health check and automatic Claude fallback
+- `--output-format json` for exact per-session token accounting
+- Board hygiene runs every cycle: fixes orphans, closes done items, routes epics to Backlog
+
+### Changed
+- `column-routes.json`: Skeptic column added, Research/Architecture route to Skeptic instead of Review
+- `dispatcher.json`: budget, evaluation, discovery, agent_models, providers config sections
+- Dashboard: dynamic pipeline rendering, usage API endpoint
+
+---
+
 
 ## [1.1.1] — 2026-04-08
 
@@ -169,3 +239,5 @@ Core dispatcher: polls GitHub Projects board, auto-routes issues by keyword, spa
 - `agents/` — 8 agent personas (founding-engineer, qa, documentarian, research-analyst, architect, marketing-expert, 3d-designer, ceo)
 - `config/dispatcher.json` + `config/column-routes.json` — pipeline configuration
 - `launchd/com.halfbakery.dispatcher.plist` — macOS scheduling
+
+[2.0.0]: https://github.com/youruser/The-Half-Bakery-Framework/compare/v1.1.1...v2.0.0

@@ -1,0 +1,11 @@
+{
+  "_comment": "Example deploy targets. Configure for your own S3 buckets.",
+  "example-project": {
+    "local_dir": "your-project",
+    "s3_path": "your-bucket/your-path",
+    "source": ".",
+    "exclude": [".git", ".github", ".local", "README.md", ".gitignore"],
+    "needs_local_overlay": false,
+    "build_command": null
+  }
+}

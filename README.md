@@ -48,7 +48,7 @@ The whole thing runs on a Claude Max subscription. No API keys, no per-token bil
 ### 1. Clone and configure
 
 ```bash
-git clone https://github.com/justintormey/half-bakery-framework.git
+git clone https://github.com/youruser/half-bakery-framework.git
 cd half-bakery-framework
 
 # Create runtime directories
