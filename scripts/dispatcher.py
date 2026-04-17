@@ -666,11 +666,13 @@ def merge_worktree(project_dir, branch_name):
         capture_output=True, text=True,
     )
     if status_result.stdout.strip():
-        # Identify dirty files under config/ and reset them to HEAD
+        # Identify dirty files under config/ and reset them to HEAD.
+        # L-1: Exclude untracked files (??) — git checkout HEAD silently fails for
+        # files with no HEAD entry, so they'd slip through and get committed.
         dirty_config_files = [
             line[3:]  # strip the two-char status prefix + space
             for line in status_result.stdout.splitlines()
-            if line[3:].startswith("config/")
+            if line[3:].startswith("config/") and not line.startswith("??")
         ]
         if dirty_config_files:
             log.warning(
@@ -678,10 +680,17 @@ def merge_worktree(project_dir, branch_name):
                 "to prevent clobbering intentional config changes: %s",
                 len(dirty_config_files), project_dir, dirty_config_files,
             )
-            subprocess.run(
+            # L-2: Check return code — a silent reset failure would leave the
+            # files dirty and they'd be committed by the git add -A below.
+            reset_result = subprocess.run(
                 ["git", "-C", project_dir, "checkout", "HEAD", "--"] + dirty_config_files,
                 capture_output=True, text=True,
             )
+            if reset_result.returncode != 0:
+                log.warning(
+                    "Config-protection reset failed (rc=%d) in %s: %s",
+                    reset_result.returncode, project_dir, reset_result.stderr.strip(),
+                )
 
         # Re-check after resetting protected files — may be clean now
         status_result2 = subprocess.run(
