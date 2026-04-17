@@ -6,6 +6,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
+## [2.0.1] — 2026-04-17
+
+### Summary
+
+Patch release: Canonical issue ID refactor. All internal state, output filenames, process names, and agent prompts now use globally unique `owner/repo/number` keys (e.g. `justintormey/ledrdr/1`) instead of bare issue numbers. This eliminates cross-repo collisions that caused misdirected GitHub comments and duplicate agent dispatch when two repos shared the same issue number. Dashboard updated to parse canonical IDs. Agent artifacts routed to per-repo `.agent/` directories (gitignored).
+
+---
+
+### 🐛 Bug Fixes
+
+#### Cross-repo issue collisions eliminated
+When multiple repos had issues with the same number (e.g. `ledrdr#1` and `CougarCast#1`), the dispatcher used bare numbers as state keys — causing `state["running"]["1"]` collisions, misdirected GitHub comments, and agents dispatched multiple times per cycle.
+
+**Root cause:** `state["running"]`, `state["pipeline_state"]`, `state["retry_queue"]`, output log filenames, and git branch names all used bare `issue_number` integers as keys.
+
+**Fix:** Introduced `canonical_id(issue_repo, issue_number) → "owner/repo/number"` and `safe_id(cid) → "owner-repo-number"` helpers. `poll_board()` stamps `canonical_id` on every board item at the source. All downstream consumers use `canonical_id` as the state key and `safe_id` for filenames and branch names.
+
+#### Duplicate dispatch within a single cycle fixed
+A related bug caused the same issue to be dispatched multiple times in one cycle when the `running_issues` dedup set was built once before the loop and not updated mid-loop. Fixed by adding `running_issues.add(item["canonical_id"])` after each dispatch within the loop.
+
+#### `cleanup_orphans` now correctly scopes branch deletion per repo
+Previously, `cleanup_orphans` used a flat set of all running issue numbers to gate branch deletion — which could block deletion of `agent/1` in repo A because `repo/B#1` was running. Fixed by building a per-repo `allowed_nums` dict from running canonical IDs.
+
+---
+
+### ✨ Changes
+
+#### Agent artifact directory standardized
+Agent prompts now instruct agents to write all output artifacts (QA reports, research notes, engineering docs) to a `.agent/` directory within their target project repo. This directory is gitignored across all repos. Previously, artifacts accumulated in the dispatcher repo root as tracked files.
+
+#### Dashboard updated for canonical IDs
+- `dashboard/serve.py`: `/api/output/` endpoint accepts `safe_id` filenames (alphanumeric + dashes) instead of bare integers
+- `dashboard/index.html`: Running agent cards parse `canonical_id` keys to display `#issueNumber` and link to the correct repo's GitHub issue page
+
+#### Agent prompts enriched
+Both `spawn_agent()` and `spawn_local_agent()` prompts now include:
+- `**Issue:** owner/repo/number — title` (canonical reference)
+- `**GitHub:** https://github.com/owner/repo/issues/N` (direct link)
+- `**Artifacts:** Write to .agent/ in the target project repo`
+- Explicit `--repo owner/repo` flag on all `gh issue` commands
+
+---
+
+### 🔗 Compatibility
+
+This is a state-breaking change: any `state.json` with bare integer keys from v2.0.0 will not be recognized as running by v2.0.1. The recommended migration is to stop all in-flight agents (`launchctl stop com.halfbakery.dispatcher`), wipe `~/.half-bakery/state.json`, and restart. In-flight agents will still complete and commit their work; they simply won't be tracked for harvest.
+
+[2.0.1]: https://github.com/youruser/The-Half-Bakery-Framework/compare/v2.0.0...v2.0.1
+
+---
 ## [2.0.0] — 2026-04-15
 
 ### Summary

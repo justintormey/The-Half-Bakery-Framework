@@ -7,6 +7,7 @@ Zero external dependencies (Python stdlib only).
 
 import json
 import os
+import re
 import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -48,11 +49,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/usage":
             self._serve_usage()
         elif path.startswith("/api/output/"):
-            issue_num = path.split("/")[-1]
-            if issue_num.isdigit():
-                self._serve_log_tail(STATE_DIR / "output" / f"{issue_num}.log", 200)
+            safe = path[len("/api/output/"):]
+            if re.match(r'^[a-zA-Z0-9][a-zA-Z0-9\-]*$', safe):
+                self._serve_log_tail(STATE_DIR / "output" / f"{safe}.log", 200)
             else:
-                self._send_error(400, "Invalid issue number")
+                self._send_error(400, "Invalid output ID")
         else:
             self._send_error(404, "Not found")
 

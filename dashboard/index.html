@@ -840,7 +840,7 @@
       const el = document.getElementById('agents');
       const running = st && st.running ? st.running : {};
       const keys = Object.keys(running);
-      const repo = cfg ? cfg.github_repo : 'youruser/half-bakery';
+      const repo = cfg ? cfg.github_repo : 'justintormey/half-bakery';
 
       let html = '<div class="section-title">Running Agents <span class="section-count">(' + keys.length + ')</span></div>';
 
@@ -852,20 +852,22 @@
         </div>`;
       } else {
         html += '<div class="card-grid">';
-        for (const num of keys) {
-          const info = running[num];
+        for (const cid of keys) {
+          const info = running[cid];
+          const cidParts = cid.split('/');
+          const issueNumber = cidParts[cidParts.length - 1];
+          const issueRepo = cidParts.slice(0, -1).join('/') || (cfg ? cfg.github_repo : 'justintormey/half-bakery');
           const agent = info.agent || 'unknown';
           const badgeClass = 'badge-' + agent;
           const agentLabel = agent.replace(/-/g, ' ');
           const project = info.project || '';
           const column = info.column || '';
           const started = info.started || '';
-          const issueRepo = info.issue_repo || repo;
-          const issueUrl = 'https://github.com/' + esc(issueRepo) + '/issues/' + esc(num);
+          const issueUrl = 'https://github.com/' + esc(issueRepo) + '/issues/' + esc(issueNumber);
 
           html += `<div class="card agent-card">
             <div class="agent-card-header">
-              <span class="agent-issue-num"><a href="${issueUrl}" target="_blank">#${esc(num)}</a></span>
+              <span class="agent-issue-num"><a href="${issueUrl}" target="_blank">#${esc(issueNumber)}</a></span>
               <span class="badge ${badgeClass}">${esc(agentLabel)}</span>
             </div>
             <div class="agent-detail"><span class="label">Project:</span> ${esc(project)}</div>
