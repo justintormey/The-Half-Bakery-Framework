@@ -46,8 +46,8 @@ The dispatch loop now sorts board items so `Ready` items are always processed be
 #### Dispatcher: macOS EDEADLK merge retry
 On macOS, VM resume can cause git merge operations to fail with `Resource deadlock avoided (EDEADLK)`. The dispatcher now detects this transient error and retries the merge once after a 15-second sleep. Without this, in-flight work was silently abandoned (branch cleaned up, issue left stranded).
 
-#### Dispatcher: multi-suffix repo directory resolution
-When resolving a GitHub repo name to a local directory path, only `-repo` suffixes were stripped. Repos named `vibecheck-app`, `my-ios`, `api-web` would fail to resolve. Now strips: `-repo`, `-app`, `-ios`, `-mac`, `-web`, `-api`.
+#### Dispatcher: local directories now mirror GitHub repo names (1:1 convention)
+Local project directories are now expected to have the same name as their GitHub counterpart. `vibecheck-app` on GitHub lives in a `vibecheck-app` local directory — no suffix transformation. The dispatcher's `resolve_project_dir()` was updated to match this convention. The `The-Half-Bakery-Framework` repo (which contains the dispatcher infrastructure itself) remains the only known naming exception.
 
 #### Dispatcher: branch names use full worktree ID
 Git worktree branches were being named `agent/{issue_number}` (bare integer), which caused branch collisions across repos. Fixed to `agent/{worktree_id}` where `worktree_id` is already scoped as `repo-name-issue-number`.
