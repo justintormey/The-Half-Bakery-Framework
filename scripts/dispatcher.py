@@ -98,12 +98,13 @@ def resolve_project_dir(projects_root, repo_name):
         if child_lower == repo_lower and (child / ".git").exists():
             return str(child)
 
-    # Check with/without common suffixes (-repo)
-    stripped = repo_name.removesuffix("-repo")
-    if stripped != repo_name:
-        result = resolve_project_dir(projects_root, stripped)
-        if result:
-            return result
+    # Check with/without common suffixes (-repo, -app, -ios, -mac, -web, -api)
+    for suffix in ("-repo", "-app", "-ios", "-mac", "-web", "-api"):
+        stripped = repo_name.removesuffix(suffix)
+        if stripped != repo_name:
+            result = resolve_project_dir(projects_root, stripped)
+            if result:
+                return result
 
     # Nested: check subdirectories of each top-level dir
     # (e.g., parent-dir/my-repo/)
@@ -267,6 +268,88 @@ def gh_issue_close(repo, issue_number):
         ["gh", "issue", "close", str(issue_number), "--repo", repo],
         capture_output=True, text=True,
     )
+
+
+def create_followup_issues(followup_text, config, fields_cache, source_cid):
+    """Parse FOLLOWUP/ISSUES_CREATED field and create GitHub issues on the board.
+
+    Format (pipe-delimited, one issue per line):
+        repo-name | Issue title | Brief description
+    or just:
+        Issue title | Brief description
+
+    If repo-name is omitted, defaults to the source issue's repo.
+    """
+    if not followup_text or followup_text.strip().lower() in ("none", "n/a", ""):
+        return []
+
+    owner = config["github_repo"].split("/")[0]
+    project_number = config["github_project_number"]
+    default_repo = config["github_repo"]
+
+    # Derive default repo from source CID (owner/repo/number)
+    parts = source_cid.split("/")
+    if len(parts) == 3:
+        default_repo = f"{parts[0]}/{parts[1]}"
+
+    created = []
+    for raw_line in followup_text.splitlines():
+        line = raw_line.strip().strip("-").strip()
+        if not line or line.lower() == "none":
+            continue
+
+        segments = [s.strip() for s in line.split("|")]
+        if len(segments) >= 3:
+            repo_hint, title, body = segments[0], segments[1], segments[2]
+            # repo_hint could be "owner/repo" or just "repo"
+            repo = f"{owner}/{repo_hint}" if "/" not in repo_hint else repo_hint
+        elif len(segments) == 2:
+            repo = default_repo
+            title, body = segments[0], segments[1]
+        elif len(segments) == 1:
+            repo = default_repo
+            title = segments[0]
+            body = f"Follow-up from {source_cid}"
+        else:
+            continue
+
+        if not title:
+            continue
+
+        body_full = f"{body}\n\n_Auto-created from agent output on {source_cid}_"
+
+        if DRY_RUN:
+            log.info("[DRY RUN] Would create issue in %s: %s", repo, title)
+            created.append(f"{repo}: {title}")
+            continue
+
+        result = subprocess.run(
+            ["gh", "issue", "create", "--repo", repo,
+             "--title", title, "--body", body_full],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            log.warning("Failed to create follow-up issue '%s' in %s: %s",
+                        title, repo, result.stderr.strip())
+            continue
+
+        issue_url = result.stdout.strip()
+        log.info("Created follow-up issue: %s", issue_url)
+
+        # Add to project board and move to Ready
+        add_result = subprocess.run(
+            ["gh", "project", "item-add", str(project_number),
+             "--owner", owner, "--url", issue_url],
+            capture_output=True, text=True,
+        )
+        if add_result.returncode == 0:
+            log.info("Added follow-up issue to board: %s", issue_url)
+        else:
+            log.warning("Could not add %s to board: %s", issue_url, add_result.stderr.strip())
+
+        created.append(issue_url)
+
+    return created
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +675,7 @@ def create_worktree(project_dir, issue_number, repo_name=None):
     # Use repo_name-issue_number to avoid collisions across repos
     worktree_id = f"{repo_name}-{issue_number}" if repo_name else str(issue_number)
     worktree_path = WORKTREE_DIR / worktree_id
-    branch_name = f"agent/{issue_number}"
+    branch_name = f"agent/{worktree_id}"
 
     if worktree_path.exists():
         log.warning("Worktree already exists at %s, cleaning up", worktree_path)
@@ -612,10 +695,21 @@ def create_worktree(project_dir, issue_number, repo_name=None):
     )
     if branch_check.returncode == 0:
         log.warning("Orphaned branch %s exists, deleting", branch_name)
+        # Prune stale worktree refs first — git refuses to delete a branch that
+        # git thinks is checked out in a worktree, even with -D, even if the
+        # worktree directory no longer exists.
         subprocess.run(
+            ["git", "-C", project_dir, "worktree", "prune"],
+            capture_output=True, text=True,
+        )
+        del_result = subprocess.run(
             ["git", "-C", project_dir, "branch", "-D", branch_name],
             capture_output=True, text=True,
         )
+        if del_result.returncode != 0:
+            log.error("Failed to delete orphaned branch %s: %s",
+                      branch_name, del_result.stderr.strip())
+            return None
 
     result = subprocess.run(
         ["git", "-C", project_dir, "worktree", "add",
@@ -623,7 +717,8 @@ def create_worktree(project_dir, issue_number, repo_name=None):
         capture_output=True, text=True,
     )
     if result.returncode != 0:
-        log.error("Failed to create worktree: %s", result.stderr.strip())
+        log.error("Failed to create worktree: %s",
+                  (result.stderr or result.stdout).strip())
         return None
 
     return str(worktree_path), branch_name
@@ -666,13 +761,11 @@ def merge_worktree(project_dir, branch_name):
         capture_output=True, text=True,
     )
     if status_result.stdout.strip():
-        # Identify dirty files under config/ and reset them to HEAD.
-        # L-1: Exclude untracked files (??) — git checkout HEAD silently fails for
-        # files with no HEAD entry, so they'd slip through and get committed.
+        # Identify dirty files under config/ and reset them to HEAD
         dirty_config_files = [
             line[3:]  # strip the two-char status prefix + space
             for line in status_result.stdout.splitlines()
-            if line[3:].startswith("config/") and not line.startswith("??")
+            if line[3:].startswith("config/")
         ]
         if dirty_config_files:
             log.warning(
@@ -680,17 +773,10 @@ def merge_worktree(project_dir, branch_name):
                 "to prevent clobbering intentional config changes: %s",
                 len(dirty_config_files), project_dir, dirty_config_files,
             )
-            # L-2: Check return code — a silent reset failure would leave the
-            # files dirty and they'd be committed by the git add -A below.
-            reset_result = subprocess.run(
+            subprocess.run(
                 ["git", "-C", project_dir, "checkout", "HEAD", "--"] + dirty_config_files,
                 capture_output=True, text=True,
             )
-            if reset_result.returncode != 0:
-                log.warning(
-                    "Config-protection reset failed (rc=%d) in %s: %s",
-                    reset_result.returncode, project_dir, reset_result.stderr.strip(),
-                )
 
         # Re-check after resetting protected files — may be clean now
         status_result2 = subprocess.run(
@@ -709,30 +795,40 @@ def merge_worktree(project_dir, branch_name):
                 capture_output=True, text=True,
             )
 
-    # Attempt the merge
-    result = subprocess.run(
-        ["git", "-C", project_dir, "merge", branch_name, "--no-edit"],
-        capture_output=True, text=True,
-    )
+    # Attempt the merge — retry once on macOS EDEADLK (transient VM lock failure)
+    import time as _time
+    for attempt in range(2):
+        result = subprocess.run(
+            ["git", "-C", project_dir, "merge", branch_name, "--no-edit"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            return True, None
 
-    if result.returncode != 0:
         error_msg = result.stderr.strip()
-        log.error("Merge failed for %s: %s", branch_name, error_msg)
-        # Abort the failed merge to restore clean state
+        log.error("Merge failed for %s (attempt %d): %s", branch_name, attempt + 1, error_msg)
+
         subprocess.run(
             ["git", "-C", project_dir, "merge", "--abort"],
             capture_output=True, text=True,
         )
-        return False, error_msg
 
-    return True, None
+        # EDEADLK: macOS post-wake transient VM lock — wait and retry
+        if "deadlock" in error_msg.lower() or "ORIG_HEAD" in error_msg:
+            if attempt == 0:
+                log.warning("EDEADLK on merge for %s — retrying in 15s", branch_name)
+                _time.sleep(15)
+                continue
+        break
+
+    return False, error_msg
 
 
 def cleanup_worktree(project_dir, issue_number, repo_name=None):
     """Remove the worktree and delete the branch. Always succeeds or returns False."""
     worktree_id = f"{repo_name}-{issue_number}" if repo_name else str(issue_number)
     worktree_path = WORKTREE_DIR / worktree_id
-    branch_name = f"agent/{issue_number}"
+    branch_name = f"agent/{worktree_id}"
 
     if worktree_path.exists():
         # Tier 1: Ask git to remove it cleanly
@@ -845,8 +941,11 @@ You are a headless agent. Follow these rules:
    DONE: <one sentence of what was accomplished>
    FILES: <comma-separated list of changed files>
    COMMITS: <commit SHAs or "none">
-   FOLLOWUP: <issues to create, or "none">
+   FOLLOWUP: <pipe-delimited follow-up issues, one per line: "repo-name | Issue title | Brief description", or "none">
    ##END##
+   For FOLLOWUP, use the short repo name (e.g. "vibecheck-app", "runbook"). The dispatcher will
+   auto-create these issues on GitHub and add them to the board. Only list genuinely new work
+   that emerged from your findings — not work already captured in existing issues.
 """
 
     if is_spanning and sibling_projects:
@@ -1034,8 +1133,11 @@ You are a headless agent running on a local LLM. Follow these rules:
    DONE: <one sentence of what was accomplished>
    FILES: <comma-separated list of changed files>
    COMMITS: <commit SHAs or "none">
-   FOLLOWUP: <issues to create, or "none">
+   FOLLOWUP: <pipe-delimited follow-up issues, one per line: "repo-name | Issue title | Brief description", or "none">
    ##END##
+   For FOLLOWUP, use the short repo name (e.g. "vibecheck-app", "runbook"). The dispatcher will
+   auto-create these issues on GitHub and add them to the board. Only list genuinely new work
+   that emerged from your findings — not work already captured in existing issues.
 """
 
     if is_spanning and sibling_projects:
@@ -1335,6 +1437,12 @@ def phase_poll_and_dispatch(state, config, fields_cache, routes):
 
     running_issues = set(state["running"].keys())
 
+    # Prioritize Ready items over mid-pipeline items so the board's priority
+    # order is respected. Within each group, board order (from poll_board) is
+    # preserved. Without this, a single issue cycling through a long pipeline
+    # monopolizes the concurrency slot and blocks top-of-backlog work.
+    items = sorted(items, key=lambda x: 0 if x["status"] == "Ready" else 1)
+
     for item in items:
         if item["canonical_id"] in running_issues:
             continue
@@ -1412,7 +1520,7 @@ def phase_poll_and_dispatch(state, config, fields_cache, routes):
         # Create worktree
         result = create_worktree(project_dir, item["issue_number"], target_project)
         if not result:
-            log.error("Failed to create worktree for issue #%d", item["issue_number"])
+            log.error("Failed to create worktree for %s", item["canonical_id"])
             continue
         worktree_path, branch_name = result
 
@@ -1446,8 +1554,8 @@ def phase_poll_and_dispatch(state, config, fields_cache, routes):
         state["running"][item["canonical_id"]] = entry
         running_issues.add(item["canonical_id"])   # prevent duplicate dispatch same cycle
         running_count += 1
-        log.info("Dispatched issue #%d to %s (PID %d)",
-                 item["issue_number"], item["status"], pid)
+        log.info("Dispatched %s to %s (PID %d)",
+                 item["canonical_id"], item["status"], pid)
 
 
 def _extract_summary(output_text):
@@ -1642,9 +1750,11 @@ def phase_harvest(state, config, fields_cache, routes):
             merge_ok, merge_error = merge_worktree(project_dir, info.get("branch", ""))
 
             if not merge_ok:
-                log.warning("Merge conflict for issue %s, moving to Review", cid)
+                is_transient = merge_error and ("deadlock" in merge_error.lower() or "ORIG_HEAD" in merge_error)
+                label = "Transient merge failure (macOS EDEADLK)" if is_transient else "Merge conflict"
+                log.warning("%s for issue %s, moving to Review", label, cid)
                 gh_issue_comment(repo, issue_number,
-                    f"**Merge conflict** — moving to Review.\n\n"
+                    f"**{label}** — moving to Review.\n\n"
                     f"Branch `{info.get('branch', '')}` preserved for manual merging.\n\n"
                     f"Agent type: `{info['agent']}`\n"
                     f"Error: `{merge_error}`")
@@ -1652,6 +1762,10 @@ def phase_harvest(state, config, fields_cache, routes):
             else:
                 # --- Skeptic routing: the Skeptic decides where work goes ---
                 if info.get("column") == "Skeptic":
+                    MAX_SKEPTIC_REJECTIONS = config.get("evaluation", {}).get("max_skeptic_rejections", 3)
+                    ps = state.get("pipeline_state", {}).get(cid, {})
+                    skeptic_rejections = ps.get("skeptic_rejections", 0)
+
                     verdict = extract_verdict(output_text)
                     if verdict:
                         decision = verdict.get("DECISION", "").upper()
@@ -1660,25 +1774,45 @@ def phase_harvest(state, config, fields_cache, routes):
                         issues_created = verdict.get("ISSUES_CREATED", "none")
 
                         # Validate route is a real column
-                        valid_columns = set(routes["columns"].keys()) | {"Ready", "Done", "Review", "Review"}
+                        valid_columns = set(routes["columns"].keys()) | {"Ready", "Done", "Review"}
                         if route not in valid_columns:
-                            route = "Review"  # fallback if Skeptic gives bad route
+                            route = "Review"
                             log.warning("Skeptic gave invalid route '%s', falling back to Review",
                                         verdict.get("ROUTE", ""))
 
+                        # Guard: Skeptic must not route to itself (infinite loop)
+                        if route == "Skeptic":
+                            log.warning("Skeptic %s routed to itself — redirecting to Review", cid)
+                            route = "Review"
+                            decision = "REJECT"
+
                         if decision == "APPROVE":
                             next_column = route
+                            # Reset rejection counter on approval
+                            state.setdefault("pipeline_state", {}).setdefault(cid, {})["skeptic_rejections"] = 0
                             log.info("Skeptic APPROVED %s → %s: %s", cid, route, reason)
                         else:
-                            next_column = route
-                            log.info("Skeptic REJECTED %s → %s: %s", cid, route, reason)
+                            skeptic_rejections += 1
+                            if skeptic_rejections >= MAX_SKEPTIC_REJECTIONS:
+                                next_column = "Review"
+                                reason += f" [Skeptic rejection cap reached ({skeptic_rejections}/{MAX_SKEPTIC_REJECTIONS}) — escalating to Review]"
+                                log.warning("Skeptic %s hit max rejections (%d) → Review", cid, skeptic_rejections)
+                            else:
+                                next_column = route
+                                state.setdefault("pipeline_state", {}).setdefault(cid, {})["skeptic_rejections"] = skeptic_rejections
+                                log.info("Skeptic REJECTED %s → %s (%d/%d): %s",
+                                         cid, route, skeptic_rejections, MAX_SKEPTIC_REJECTIONS, reason)
 
                         comment_body = (
                             f"**Skeptic verdict: {decision}** → **{next_column}**\n\n"
                             f"**Reason:** {reason}\n\n"
                         )
-                        if issues_created and issues_created.lower() != "none":
-                            comment_body += f"**Issues created:** {issues_created}\n\n"
+                        skeptic_created = create_followup_issues(issues_created, config, fields_cache, cid)
+                        if skeptic_created:
+                            urls_md = "\n".join(f"- {u}" for u in skeptic_created)
+                            comment_body += f"**Issues created ({len(skeptic_created)}):**\n{urls_md}\n\n"
+                        elif issues_created and issues_created.lower() != "none":
+                            comment_body += f"**Issues noted:** {issues_created}\n\n"
 
                         # Append raw verdict for transparency
                         raw = output_text[-1500:] if len(output_text) > 1500 else output_text
@@ -1712,8 +1846,12 @@ def phase_harvest(state, config, fields_cache, routes):
                             f"**Commits:** {structured.get('COMMITS', 'none listed')}\n\n"
                         )
                         followup = structured.get("FOLLOWUP", "none")
-                        if followup and followup.lower() != "none":
-                            comment_body += f"**Follow-up needed:** {followup}\n\n"
+                        created_urls = create_followup_issues(followup, config, fields_cache, cid)
+                        if created_urls:
+                            urls_md = "\n".join(f"- {u}" for u in created_urls)
+                            comment_body += f"**Follow-up issues created ({len(created_urls)}):**\n{urls_md}\n\n"
+                        elif followup and followup.lower() not in ("none", "n/a", ""):
+                            comment_body += f"**Follow-up noted (not auto-created):** {followup}\n\n"
                         comment_body += f"Moving to **{next_column}**."
                     else:
                         raw = output_text[-2000:] if len(output_text) > 2000 else output_text

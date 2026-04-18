@@ -38,14 +38,12 @@ SESSION_LOG = USAGE_DIR / "sessions.jsonl"
 # These are conservative estimates. Adjust based on observed 429 patterns.
 
 WINDOW_HOURS = 5
-WINDOW_OUTPUT_CEILING = 300_000   # output tokens per 5h window (Max 5x plan, mostly Sonnet)
-WINDOW_INPUT_CEILING = 2_000_000  # input tokens per 5h window (generous, cached doesn't count)
-DAILY_SESSION_CEILING = 80        # sessions per day
+WINDOW_OUTPUT_CEILING = 3_500_000  # output tokens per 5h window (Max 5x plan, ~7% = 256k observed)
+WINDOW_INPUT_CEILING = 20_000_000  # input tokens per 5h window
+DAILY_SESSION_CEILING = 80         # sessions per day
 
-# Weekly all-models cap for Max 5x. At 40% used on Monday with 5 days
-# remaining, we need to target ~12% per day = ~720K tokens/day.
-# Total weekly budget estimated at ~6M tokens (conservative for 5x plan).
-WEEKLY_OUTPUT_CEILING = 6_000_000
+# Weekly all-models cap for Max 5x.
+WEEKLY_OUTPUT_CEILING = 50_000_000
 
 # Cooldown after rate limit hit
 RATE_LIMIT_COOLDOWN_MIN = 30

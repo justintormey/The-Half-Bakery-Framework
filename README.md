@@ -29,9 +29,20 @@ No orchestration framework. No token-burning coordination layer. Just a cron job
   └──────────────────────────────────────────────────────────┘
 ```
 
-## What's New in v2.0.0
+## What's New in v2.0.2
 
-This is a major release. The system went from "dispatch and hope" to "evaluate, verify, and retry."
+- **Autonomous Follow-up Issues** — agents emit structured `FOLLOWUP` lines; the dispatcher auto-creates those GitHub issues and adds them to the board (no human re-entry)
+- **Designer Agent** — new visual/3D design specialist for layout, component, and visual production work
+- **Skeptic Loop Protection** — self-routing guard + configurable max-rejection cap prevent runaway Skeptic cycles
+- **EDEADLK Merge Retry** — macOS VM-resume deadlocks no longer silently abandon in-flight work
+- **Ready-First Dispatch** — Ready items always take priority over mid-pipeline items in the same cycle
+- **Vision Scan Own Quota** — vision discovery no longer starved by chore/TODO scanner budget
+- **Orphan Rescue Pagination** — board queries now paginate past 100 items (no more infinite re-rescue loops)
+- **Usage Tracker Calibration** — corrected 5h window ceilings for Claude Max 5x (was tuned for 20x)
+
+### What's in v2.0.0
+
+The major release that went from "dispatch and hope" to "evaluate, verify, and retry."
 
 - **Smart Evaluation** — 6-gate layered checks before advancing work (zero tokens for 5 of 6 gates)
 - **Skeptic Agent** — verification gate that trusts nothing, reads actual diffs, can reject and reroute
@@ -123,8 +134,23 @@ Six specialists, each with a persona and clear boundaries:
 | **documentarian** | Memory | Maintains project history and documentation |
 | **research-analyst** | Investigation | Structured analysis, market research, feasibility studies |
 | **architect** | Design | System design, RFCs, trade-off analysis |
+| **designer** | Visual/3D | Layout, component design, and visual production |
 
 Each agent gets a persona file (`AGENTS.md`), execution checklist (`HEARTBEAT.md`), and an isolated git worktree.
+
+### Autonomous Follow-up Issue Creation
+
+When agents complete work, they report new work discovered in the process using a structured `FOLLOWUP` field:
+
+```
+##SUMMARY##
+DONE: Researched offline storage options for vibecheck
+FOLLOWUP: vibecheck-app | Add offline mode | SQLite-backed queue, ~2 days
+          vibecheck-app | Handle sync conflicts | Need merge strategy for concurrent edits
+##END##
+```
+
+The dispatcher parses these lines, creates the GitHub issues, adds them to the board in Ready state, and posts the URLs in the completion comment. Agents generate the backlog. You stay out of the loop.
 
 ### Per-Agent Model Selection
 
@@ -179,6 +205,8 @@ The Skeptic is the trust-but-verify layer. It:
 - Compares deliverables against issue requirements
 - Can **APPROVE** (advance), **REJECT** (send back with feedback), or create new issues
 - Routes work to any column based on its verdict
+
+Loop protection: the dispatcher caps Skeptic rejections at `max_skeptic_rejections` (default 3) and blocks self-routing. After the cap is hit, work escalates to Review for human inspection.
 
 ## Proactive Work Discovery
 

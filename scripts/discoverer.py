@@ -82,6 +82,8 @@ def phase_discover(state, config, fields_cache, dry_run=False):
                                                   ["auto-discovered", "chore"],
                                                   project_number)
                         if issue_url:
+                            _move_issue_to_backlog(issue_url, config, fields_cache)
+                            _link_to_polish_epic(owner, issue_url, config, fields_cache)
                             discoveries[todo_key] = now.isoformat()
                             created_count += 1
                             log.info("Created annotation issue: %s", title)
@@ -111,6 +113,8 @@ def phase_discover(state, config, fields_cache, dry_run=False):
                                                   ["auto-discovered", "chore"],
                                                   project_number)
                         if issue_url:
+                            _move_issue_to_backlog(issue_url, config, fields_cache)
+                            _link_to_polish_epic(owner, issue_url, config, fields_cache)
                             discoveries[dep_key] = now.isoformat()
                             created_count += 1
                             log.info("Created deps issue: %s", title)
@@ -138,19 +142,24 @@ def phase_discover(state, config, fields_cache, dry_run=False):
                                                   ["auto-discovered", "bug", "security"],
                                                   project_number)
                         if issue_url:
+                            _move_issue_to_backlog(issue_url, config, fields_cache)
+                            _link_to_polish_epic(owner, issue_url, config, fields_cache)
                             discoveries[sec_key] = now.isoformat()
                             created_count += 1
                             log.info("Created security issue: %s", title)
 
     # --- Vision-driven discovery: compare vision doc against existing issues ---
-    # Runs daily (not on the general cooldown) — the vision is the source of truth
-    if discovery_cfg.get("scan_vision", True) and created_count < max_per_cycle:
+    # Runs on its own cadence with its own quota — vision is the primary backlog source.
+    # NOT gated by max_per_cycle (which governs low-signal chore scans).
+    if discovery_cfg.get("scan_vision", True):
         vision_key = "vision_scan"
         vision_cooldown = discovery_cfg.get("vision_cooldown_days", 1)
+        vision_max = discovery_cfg.get("vision_max_issues_per_scan", 15)
+        vision_created = 0
         if not _in_cooldown(discoveries, vision_key, vision_cooldown, now):
             vision_issues = _scan_vision_gaps(config, owner, project_number)
             for vi in vision_issues:
-                if created_count >= max_per_cycle:
+                if vision_created >= vision_max:
                     break
                 vi_key = f"vision:{vi['repo']}:{vi['title'][:40]}"
                 if _in_cooldown(discoveries, vi_key, cooldown_days, now):
@@ -165,6 +174,7 @@ def phase_discover(state, config, fields_cache, dry_run=False):
                              vi['title'])
                     discoveries[vi_key] = now.isoformat()
                     created_count += 1
+                    vision_created += 1
                 else:
                     issue_url = _create_issue(owner, vi['repo'], vi['title'], vi['body'],
                                               labels, project_number)
@@ -175,6 +185,7 @@ def phase_discover(state, config, fields_cache, dry_run=False):
                             _move_issue_to_ready(issue_url, config, fields_cache)
                         discoveries[vi_key] = now.isoformat()
                         created_count += 1
+                        vision_created += 1
                         log.info("Created %s: %s",
                                  "interview question → Review" if is_question else "vision issue → Ready",
                                  vi['title'])
@@ -218,7 +229,8 @@ def phase_discover(state, config, fields_cache, dry_run=False):
                                               ["auto-discovered", "chore"],
                                               project_number)
                     if issue_url:
-                        _move_issue_to_ready(issue_url, config, fields_cache)
+                        _move_issue_to_backlog(issue_url, config, fields_cache)
+                        _link_to_polish_epic(owner, issue_url, config, fields_cache)
                         discoveries[gap_key] = now.isoformat()
                         created_count += 1
                         log.info("Created quality issue: %s", title)
@@ -526,13 +538,14 @@ ISSUE|repo-name|Title of the issue|One paragraph describing what needs to be don
 QUESTION|repo-name|Question title|The specific question for the product owner
 
 Rules:
-- repo-name must match a real GitHub repo name (e.g. your-project-1, your-project-2)
-- Output 5 ISSUES and 2 QUESTIONS
-- Prioritize the highest-tier projects from the vision document
+- repo-name must match the EXACT GitHub repo name (e.g. vibecheck-app, runbook, half-bakery, recon-radar, CougarCast, true-or-do, ugv_rpi)
+- Output 15 ISSUES and 3 QUESTIONS
+- Prioritize Tier 1 revenue projects (Runbook/runbook, VibeCheck/vibecheck-app) above all else — fill their backlogs DEEP
 - Then Tier 2 portfolio projects
-- Be specific: "implement X in Y" not "improve Z"
+- Be specific and granular: one concrete task per issue, not bundles
+- Think about the FULL path to shipping: architecture, implementation, testing, distribution, marketing
 - Skip anything similar to these existing issues: {', '.join(list(existing)[:40])}
-- The backlog should be DEEP — think about ALL the work needed to ship these products, not just the next step
+- The backlog should be DEEP — every deliverable in the vision should become multiple issues
 
 Vision document:
 {vision_text[:10000]}"""
@@ -677,41 +690,54 @@ def _rescue_orphan_issues(config, fields_cache):
     owner = config["github_repo"].split("/")[0]
     project_num = config["github_project_number"]
 
-    # Get all items currently on the board
-    query = f'''query {{
-        user(login: "{owner}") {{
-            projectV2(number: {project_num}) {{
-                items(first: 100) {{
-                    nodes {{
-                        content {{
-                            ... on Issue {{
-                                number
-                                repository {{ nameWithOwner }}
+    # Get all items currently on the board — paginated to avoid missing items beyond 100
+    on_board = set()
+    cursor = None
+    while True:
+        after = f', after: "{cursor}"' if cursor else ""
+        query = f'''query {{
+            user(login: "{owner}") {{
+                projectV2(number: {project_num}) {{
+                    items(first: 100{after}) {{
+                        nodes {{
+                            content {{
+                                ... on Issue {{
+                                    number
+                                    repository {{ nameWithOwner }}
+                                }}
                             }}
                         }}
+                        pageInfo {{ hasNextPage endCursor }}
                     }}
                 }}
             }}
-        }}
-    }}'''
+        }}'''
+        try:
+            result = subprocess.run(
+                ["gh", "api", "graphql", "-f", f"query={query}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                break
+            data = json.loads(result.stdout)
+        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+            break
 
-    try:
-        result = subprocess.run(
-            ["gh", "api", "graphql", "-f", f"query={query}"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            return 0
-        data = json.loads(result.stdout)
-    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        items_data = data.get("data", {}).get("user", {}).get("projectV2", {}).get("items", {})
+        for node in items_data.get("nodes", []):
+            content = node.get("content")
+            if content and content.get("number"):
+                repo = (content.get("repository") or {}).get("nameWithOwner", "")
+                on_board.add(f"{repo}#{content['number']}")
+
+        page_info = items_data.get("pageInfo", {})
+        if page_info.get("hasNextPage"):
+            cursor = page_info["endCursor"]
+        else:
+            break
+
+    if not on_board:
         return 0
-
-    on_board = set()
-    for node in data.get("data", {}).get("user", {}).get("projectV2", {}).get("items", {}).get("nodes", []):
-        content = node.get("content")
-        if content and content.get("number"):
-            repo = (content.get("repository") or {}).get("nameWithOwner", "")
-            on_board.add(f"{repo}#{content['number']}")
 
     # Get all open issues from repos we manage
     projects_root = Path(config["projects_root"])
@@ -760,6 +786,52 @@ def _rescue_orphan_issues(config, fields_cache):
                     rescued += 1
 
     return rescued
+
+
+def _move_issue_to_backlog(issue_url, config, fields_cache):
+    """Move a newly-created issue to the Backlog column."""
+    backlog_id = fields_cache["fields"].get("Status", {}).get("options", {}).get("Backlog")
+    if not backlog_id:
+        return
+    _move_issue_to_ready_or_column(issue_url, config, fields_cache, backlog_id)
+
+
+def _link_to_polish_epic(owner, issue_url, config, fields_cache):
+    """Add a newly-created chore/polish issue as a sub-issue of the global polish epic.
+
+    The polish epic is the half-bakery issue titled 'Let's polish every project
+    to portfolio quality'. Its number is stored in config or discovered once per
+    session and cached.
+    """
+    polish_epic_number = config.get("polish_epic_number")
+    if not polish_epic_number:
+        return
+
+    # Get the child issue's database ID from its URL
+    parts = issue_url.rstrip("/").split("/")
+    if len(parts) < 2:
+        return
+    child_repo = parts[-3]
+    child_number = parts[-1]
+
+    try:
+        id_result = subprocess.run(
+            ["gh", "api", f"/repos/{owner}/{child_repo}/issues/{child_number}", "--jq", ".id"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if id_result.returncode != 0 or not id_result.stdout.strip():
+            return
+        child_db_id = int(id_result.stdout.strip())
+
+        subprocess.run(
+            ["gh", "api", "--method", "POST",
+             f"/repos/{owner}/half-bakery/issues/{polish_epic_number}/sub_issues",
+             "-H", "Accept: application/vnd.github.sub-issues-preview+json",
+             "-F", f"sub_issue_id={child_db_id}"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
 
 
 def _move_issue_to_column(issue_url, config, fields_cache, column_name):

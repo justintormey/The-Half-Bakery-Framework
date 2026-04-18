@@ -6,6 +6,93 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
+## [2.0.2] — 2026-04-17
+
+### Summary
+
+Patch release: autonomous follow-up issue generation, designer agent, six dispatcher/discoverer reliability fixes, and corrected Claude Max 5x usage ceilings. Agents now self-report new work as structured pipe-delimited lines; the dispatcher auto-creates those GitHub issues and adds them to the board. The discoverer's vision scan and orphan rescue are both more reliable at scale.
+
+---
+
+### ✨ New Features
+
+#### Autonomous follow-up issue creation
+Agents now emit structured `FOLLOWUP` lines in their `##SUMMARY##` block using a pipe-delimited format: `repo-name | Issue title | Brief description`. The dispatcher parses these after harvest, calls `gh issue create` for each entry, adds the resulting issues to the project board (status: Ready), and reports the created URLs in the completion comment. This closes the loop on agent findings — research agents, engineers, and the Skeptic can all surface new work without human re-entry.
+
+The Skeptic's existing `ISSUES_CREATED` field receives the same treatment.
+
+**Format:**
+```
+FOLLOWUP: vibecheck-app | Add offline mode | Users reported crashes when offline
+          runbook | Automate DNS failover | Identified gap in Chapter 4
+```
+
+#### Designer agent
+New `designer` specialist agent for visual and 3D design work. Fetches design assets at runtime via `getdesign` and handles layout, component, and visual production tasks. Routed via the `3D Design` column.
+
+---
+
+### 🐛 Bug Fixes
+
+#### Dispatcher: Skeptic infinite loop prevention
+Two guards added to prevent the Skeptic from burning unbounded tokens:
+
+1. **Self-routing guard** — if the Skeptic routes to itself (e.g. due to a malformed verdict), the dispatcher intercepts and redirects to Review with a warning.
+2. **Max rejections cap** — configurable via `evaluation.max_skeptic_rejections` (default 3). After N rejections, the dispatcher escalates to Review instead of sending work back to the implementation column again.
+
+#### Dispatcher: Ready-first dispatch priority
+The dispatch loop now sorts board items so `Ready` items are always processed before mid-pipeline items in the same cycle. Previously, a mid-pipeline item (e.g. Engineering → QA) could starve higher-priority Ready items waiting for their first agent.
+
+#### Dispatcher: macOS EDEADLK merge retry
+On macOS, VM resume can cause git merge operations to fail with `Resource deadlock avoided (EDEADLK)`. The dispatcher now detects this transient error and retries the merge once after a 15-second sleep. Without this, in-flight work was silently abandoned (branch cleaned up, issue left stranded).
+
+#### Dispatcher: multi-suffix repo directory resolution
+When resolving a GitHub repo name to a local directory path, only `-repo` suffixes were stripped. Repos named `vibecheck-app`, `my-ios`, `api-web` would fail to resolve. Now strips: `-repo`, `-app`, `-ios`, `-mac`, `-web`, `-api`.
+
+#### Dispatcher: branch names use full worktree ID
+Git worktree branches were being named `agent/{issue_number}` (bare integer), which caused branch collisions across repos. Fixed to `agent/{worktree_id}` where `worktree_id` is already scoped as `repo-name-issue-number`.
+
+#### Discoverer: vision scan gets its own quota
+The vision scan (which reads `project-visions.md` and generates issues for unstarted deliverables) was gated by `max_per_cycle` — a budget shared with chore/TODO/dependency discovery. A vision scan that ran last produced 1 issue because the chore scanner already consumed the quota. Vision scan now has its own `vision_max_issues_per_scan` limit (default 15) and runs independently of the other discovery channels.
+
+#### Discoverer: orphan rescue pagination
+The orphan rescue query fetched at most 100 board items (`items(first: 100)`). Projects with more than 100 items on the board would appear to the discoverer as if those items weren't on the board — causing already-tracked issues to be "rescued" (re-added) on every cycle. Fixed with a full pagination loop using `pageInfo.hasNextPage` / `endCursor`.
+
+#### Discoverer: auto-discovered issues now set Backlog status and link polish epic
+Issues created by the discoverer now have their project board status set to `Backlog` and are linked to a polish parent epic when applicable.
+
+---
+
+### 📐 Configuration Changes
+
+New optional config keys:
+
+```json
+"evaluation": {
+    "max_skeptic_rejections": 3
+},
+"discovery": {
+    "vision_max_issues_per_scan": 15
+}
+```
+
+---
+
+### 📊 Usage Tracker Corrections
+
+The `usage_tracker.py` 5-hour rolling window ceiling was calibrated for the Claude Max 20x plan, not 5x. Corrected values for Max 5x ($100/month):
+
+| Field | Before | After |
+|-------|--------|-------|
+| `WINDOW_OUTPUT_CEILING` | 300,000 | 3,500,000 |
+| `WINDOW_INPUT_CEILING` | 2,000,000 | 20,000,000 |
+| `WEEKLY_OUTPUT_CEILING` | 6,000,000 | 50,000,000 |
+
+The old values caused false PAUSED state — the tracker thought the 5h window was at 85%+ when actual Claude app usage showed ~7%.
+
+[2.0.2]: https://github.com/youruser/The-Half-Bakery-Framework/compare/v2.0.1...v2.0.2
+
+---
 ## [2.0.1] — 2026-04-17
 
 ### Summary
