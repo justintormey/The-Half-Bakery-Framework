@@ -1,8 +1,8 @@
 {
   "max_concurrent": 3,
   "agent_timeout_minutes": 45,
-  "projects_root": "~/Documents/PROJECTS",
-  "agents_root": "~/Documents/PROJECTS/half-bakery/agents",
+  "projects_root": "~/PROJECTS",
+  "agents_root": "~/PROJECTS/half-bakery/agents",
   "github_repo": "youruser/half-bakery",
   "github_project_number": 1,
   "state_dir": "~/.half-bakery",
@@ -28,7 +28,8 @@
     "research-analyst": "sonnet",
     "skeptic": "sonnet",
     "qa": "sonnet",
-    "documentarian": "sonnet"
+    "documentarian": "sonnet",
+    "designer": "sonnet"
   },
   "budget": {
     "work_hours": {"start": 9, "end": 18},

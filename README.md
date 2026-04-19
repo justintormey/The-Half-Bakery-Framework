@@ -124,7 +124,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.halfbakery.dispatche
 
 ## The Agents
 
-Six specialists, each with a persona and clear boundaries:
+Seven specialists, each with a persona and clear boundaries:
 
 | Agent | Role | What it does |
 |-------|------|-------------|
@@ -163,7 +163,8 @@ Configure which Claude model each agent uses in `dispatcher.json`:
     "skeptic": "sonnet",
     "qa": "sonnet",
     "documentarian": "sonnet",
-    "research-analyst": "sonnet"
+    "research-analyst": "sonnet",
+    "designer": "sonnet"
 }
 ```
 
