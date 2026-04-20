@@ -29,7 +29,23 @@ No orchestration framework. No token-burning coordination layer. Just a cron job
   └──────────────────────────────────────────────────────────┘
 ```
 
-## What's New in v2.0.2
+## What's New in v2.1.0
+
+- **BudgetTracker class** — shared concurrency-slot tracker keeps dispatch phases in sync without re-reading state mid-loop
+- **Automatic state migration** — `migrate_state()` runs on every boot; upgrades `state.json` schema without manual wipes
+- **Project path overrides** — explicit `project_overrides` config lets you map GitHub repo names to non-standard local paths
+- **Fail-closed LLM gate** — evaluator infra failures now route to Review instead of silently advancing unreviewed work
+- **Simplified feature pipeline** — Research → Architecture → Engineering → QA → Docs → Skeptic (fewer mid-pipeline Skeptic gates)
+- **Skeptic: Epic linkage rule** — REJECTs any PR that creates issues without linking them to a parent Epic
+- **Skeptic: Data Lifecycle Audit** — REJECTs PRs touching persisted data without auditing writers, live data, and migration
+- **Designer: skip if no UI surface** — prevents wasted design work on backend/CLI/firmware projects
+- **Designer: updated brand mapping** — airbnb for e-commerce, spotify for media, tesla for automotive
+- **Design pipeline** — new `design` pipeline type; `polish` issues now include a Design pass
+- **Stuck is non-dispatchable** — Stuck items no longer eligible for auto-dispatch
+- **Node_modules exclusion fixed** — Python-level post-filter catches BSD grep's silent failure to honor `--exclude-dir`
+- **Backlog auto-promotion disabled** — discoverer no longer promotes Epics to Ready behind the user's back
+
+### What's in v2.0.2
 
 - **Autonomous Follow-up Issues** — agents emit structured `FOLLOWUP` lines; the dispatcher auto-creates those GitHub issues and adds them to the board (no human re-entry)
 - **Designer Agent** — new visual/3D design specialist for layout, component, and visual production work

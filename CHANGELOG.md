@@ -6,6 +6,136 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
+## [2.1.0] — 2026-04-20
+
+### Summary
+
+Minor release: schema migration, dispatcher reliability hardening, fail-closed evaluation gate, designer agent improvements, and expanded Skeptic rules. The `BudgetTracker` class replaces ad-hoc concurrency counting; `migrate_state()` makes state schema upgrades safe and automatic. The Skeptic now enforces Epic linkage and data lifecycle audits on every PR. The discoverer no longer fights the Epic-dictates-dispatch model.
+
+---
+
+### ✨ New Features
+
+#### BudgetTracker class
+Shared concurrency-slot tracker initialized from `len(state["running"])` so the starting count always reflects already-live agents. Each dispatch phase calls `reserve()` before spawning and `release()` on spawn failure, keeping the tracker in sync with `state["running"]` without either phase re-reading the dict mid-loop. Eliminates the previous pattern of manually managing concurrency counts across dispatch phases.
+
+#### migrate_state() — automatic schema migration
+`migrate_state()` runs idempotently on every dispatcher boot, performing two migration passes:
+
+1. **Skeptic rejection counters** — moves `skeptic_rejections` out of `pipeline_state[cid]` objects into the top-level `skeptic_rejections` dict; drops counter-only entries with no `pipeline` key to prevent `KeyError` on the pipeline reader.
+2. **Pipeline unification** — moves legacy `pipeline` / `pipeline_index` keys from `state["running"][cid]` into `state["pipeline_state"][cid]` (single authoritative source), without overwriting existing entries.
+
+No manual state wipes required for schema upgrades — the migration handles it.
+
+#### resolve_project_dir: explicit overrides
+`resolve_project_dir()` now accepts an optional `overrides` dict (from `config["project_overrides"]`). When a repo name has an override entry, the dispatcher uses the explicit path before attempting any automatic discovery. Useful for repos where the local directory name diverges from the GitHub name or lives outside `projects_root`.
+
+---
+
+### 🐛 Bug Fixes
+
+#### Evaluator: fail-closed LLM gate
+Previously, when the LLM spot-check CLI was unavailable (infra failure, timeout, etc.), the gate returned `True` (pass) and the work advanced silently. This allowed unreviewed work to reach Done on infra failure. Fixed: the gate now returns `False` and routes to Review for human inspection. Masking infra failures as PASS is how hallucinated completions sneak through.
+
+#### Discoverer: node_modules exclusion (Python-level post-filter)
+The TODO/FIXME scanner relied solely on `grep --exclude-dir` flags to filter non-project directories. BSD grep on macOS can silently ignore `--exclude-dir`, causing false-positive issues from `node_modules/` packages. Fixed with:
+
+- `_EXCLUDED_DIRS` set: canonical list of directories to exclude (`node_modules`, `.git`, `vendor`, `venv`, `dist`, `build`, `__pycache__`, `.next`, `.nuxt`, `coverage`, `.cache`, `.tox`, `target`, `Pods`)
+- `_is_excluded_path()` post-filter: drops any grep match whose path contains an excluded directory segment, regardless of grep flag behavior
+- Result cap applied **after** filtering — excluded paths no longer consume the 20-result budget before real source matches are counted
+
+#### Discoverer: Backlog auto-promotion disabled
+Auto-promotion from Backlog → Ready was fighting the Epic-dictates-dispatch model. The user controls priority explicitly via Epic Status; auto-promotion was bumping Epics from Backlog → Ready behind the user's back. `_promote_from_backlog()` is preserved in code but no longer called from the discovery cycle.
+
+---
+
+### 🤖 Agent Improvements
+
+#### Skeptic: Epic linkage rule
+Every issue created or surfaced by an agent must have a parent Epic. Orphan issues (no parent) are ignored by the dispatcher's Epic-gate and sit inert. The Skeptic now **REJECT**s any PR where newly-created issues (via FOLLOWUP, ISSUES_CREATED, or direct `gh issue create`) lack parent Epic linkage.
+
+The Skeptic's issue-creation template now includes the sub-issue GraphQL mutation:
+```bash
+CHILD_ID=$(gh api /repos/{owner}/{repo}/issues/{new_number} --jq .node_id)
+PARENT_ID=$(gh api /repos/{owner}/{repo}/issues/{epic_number} --jq .node_id)
+gh api graphql -f query='mutation { addSubIssue(input: { issueId: "'$PARENT_ID'" subIssueId: "'$CHILD_ID'" }) { issue { number } } }'
+```
+
+#### Skeptic: Data Lifecycle Audit rule
+PRs touching persisted data shapes (state files, GitHub project fields, config files, any dict that survives across runs) now require a three-point audit. Missing any one = **REJECT**:
+
+1. **Other writers** — grep every write site; new fields must be populated by every writer or tolerated by every reader
+2. **Live data** — check actual stored values; existing entries must match the new reader's assumptions
+3. **Migration** — schema tightening (new required field, renamed key, split schema) demands an idempotent migration
+
+Background: a PR adding `pipeline` / `pipeline_index` to `pipeline_state[cid]` left 11 legacy counter-only entries unhandled. The reader crashed every cycle; the whole fleet was blocked for hours. The audit rule codifies the lesson.
+
+#### Designer: skip if no UI surface
+The designer agent now short-circuits with a one-sentence note when the project is pure backend, embedded firmware, CLI-only, or a data pipeline with no web output. Prevents wasted design work on projects where visual design is inapplicable.
+
+#### Designer: brand mapping updates
+Updated brand recommendations:
+- E-commerce / retail: `airbnb` (was `shopify`)
+- Media / editorial: `spotify` (was `wired`)
+- Automotive / hardware: `tesla` added
+
+Agent now runs `npx getdesign@latest list` when the project type is ambiguous (brand list grows regularly).
+
+#### Designer: Section 9 (Agent Prompts) instruction
+Agent now reads Section 9 of the fetched `DESIGN.md` before applying styles. Section 9 contains the design system author's own AI-specific instructions for applying the file — skipping it was causing agents to miss critical guidance.
+
+---
+
+### 📐 Configuration Changes
+
+#### column-routes.json: Design column
+```json
+"Design": { "agent": "designer", "next": "Skeptic" }
+```
+The `designer` agent is now a first-class pipeline column. Routes to Skeptic after completion.
+
+#### column-routes.json: design pipeline
+```json
+"design": ["Design", "Skeptic", "Done"]
+```
+New pipeline type for pure design work.
+
+#### column-routes.json: polish pipeline includes Design
+```json
+"polish": ["Design", "Engineering", "QA", "Skeptic", "Done"]
+```
+Polish issues now get a design pass before engineering (previously engineering-only).
+
+#### column-routes.json: Stuck added to non_dispatchable
+`"Stuck"` added to `non_dispatchable` list. Stuck items (those that have exceeded retry limits or require human intervention) are no longer eligible for auto-dispatch.
+
+---
+
+### 📋 Pipeline Changes
+
+#### Simplified feature pipeline
+The `feature` pipeline now has fewer Skeptic gates:
+
+**Before:** `Research → Skeptic → Architecture → Skeptic → Engineering → QA → Docs → Skeptic → Done`
+
+**After:** `Research → Architecture → Engineering → QA → Docs → Skeptic → Done`
+
+The mid-pipeline Skeptic gates after Research and Architecture were adding latency without proportional quality benefit for most feature work. The terminal Skeptic gate before Done remains.
+
+---
+
+### 🔗 Compatibility
+
+All changes are backward-compatible. New config keys are read with `.get()` fallbacks:
+- `config.get("project_overrides", {})` — defaults to no overrides
+- `evaluation.get("max_skeptic_rejections", 3)` — already in v2.0.2
+- `discovery.get("vision_max_issues_per_scan", 15)` — already in v2.0.2
+
+Existing `state.json` files are handled by `migrate_state()` on first boot. No manual wipe required.
+
+[2.1.0]: https://github.com/youruser/The-Half-Bakery-Framework/compare/v2.0.2...v2.1.0
+
+---
 ## [2.0.2] — 2026-04-17
 
 ### Summary
