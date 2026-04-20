@@ -235,11 +235,12 @@ def phase_discover(state, config, fields_cache, dry_run=False):
                         created_count += 1
                         log.info("Created quality issue: %s", title)
 
-    # --- Promote Backlog → Ready when queue is empty ---
-    if created_count == 0 and not dry_run:
-        promoted = _promote_from_backlog(state, config, fields_cache)
-        if promoted:
-            log.info("Promoted backlog item to Ready: #%s", promoted)
+    # Auto-promotion from Backlog → Ready is DISABLED (2026-04-19).
+    # Under the Epic-dictates-dispatch model, the user controls priority
+    # explicitly via Epic Status. Auto-promotion was fighting that intent
+    # by bumping Epics from Backlog → Ready behind the user's back.
+    # The _promote_from_backlog function below is preserved for reference
+    # but no longer called from the cycle.
 
     if created_count > 0:
         log.info("Discovery phase: created %d issues", created_count)
@@ -249,14 +250,36 @@ def phase_discover(state, config, fields_cache, dry_run=False):
 # Scanners
 # ---------------------------------------------------------------------------
 
+# Directories that are never project-owned source code.  Used as both
+# grep --exclude-dir hints AND as a Python-level post-filter (defense-in-depth
+# against BSD grep silently ignoring --exclude-dir on certain macOS versions).
+_EXCLUDED_DIRS = {
+    "node_modules", ".git", "vendor", "venv", ".venv",
+    "dist", "build", "__pycache__", ".next", ".nuxt",
+    "coverage", ".cache", ".tox", "eggs", ".eggs",
+    "target",  # Rust / Maven
+    "Pods",    # CocoaPods
+}
+
+def _is_excluded_path(file_path: str) -> bool:
+    """Return True if the file path contains any excluded directory segment."""
+    parts = Path(file_path).parts
+    return any(part in _EXCLUDED_DIRS for part in parts)
+
+
 def _scan_todos(project_dir):
-    """Find annotation-tag comments in source code."""
+    """Find annotation-tag comments in project source code.
+
+    Uses grep --exclude-dir flags as a first pass, then applies a Python-level
+    path filter as defense-in-depth — BSD grep on macOS can silently fail to
+    honour --exclude-dir, which caused false-positive issues being created for
+    node_modules content (half-bakery#122).
+    """
+    exclude_dir_args = [f"--exclude-dir={d}" for d in _EXCLUDED_DIRS]
     try:
         result = subprocess.run(
             ["grep", "-rn",
-             "--exclude-dir=node_modules", "--exclude-dir=.git",
-             "--exclude-dir=vendor", "--exclude-dir=venv", "--exclude-dir=.venv",
-             "--exclude-dir=dist", "--exclude-dir=build", "--exclude-dir=__pycache__",
+             *exclude_dir_args,
              "--include=*.py", "--include=*.js", "--include=*.ts",
              "--include=*.jsx", "--include=*.tsx", "--include=*.swift",
              "--include=*.go", "--include=*.rs",
@@ -267,15 +290,22 @@ def _scan_todos(project_dir):
         return []
 
     todos = []
-    for line in result.stdout.splitlines()[:20]:  # cap at 20
+    for line in result.stdout.splitlines():
         match = _LINE_RE.match(line)
-        if match:
-            todos.append({
-                "file": match.group(1),
-                "line": int(match.group(2)),
-                "tag": match.group(3),
-                "text": match.group(4).strip(),
-            })
+        if not match:
+            continue
+        file_path = match.group(1)
+        # Python-level guard: skip any path that traverses an excluded directory.
+        if _is_excluded_path(file_path):
+            continue
+        todos.append({
+            "file": file_path,
+            "line": int(match.group(2)),
+            "tag": match.group(3),
+            "text": match.group(4).strip(),
+        })
+        if len(todos) >= 20:  # cap at 20 source-only results
+            break
     return todos
 
 
