@@ -3,6 +3,7 @@
     "Research":     { "agent": "research-analyst",  "next": "Skeptic" },
     "Architecture": { "agent": "architect",         "next": "Skeptic" },
     "Engineering":  { "agent": "founding-engineer",  "next": "QA" },
+    "Design":       { "agent": "designer",          "next": "Skeptic" },
     "Skeptic":      { "agent": "skeptic",           "next": "Ready" },
     "QA":           { "agent": "qa",                "next": "Docs" },
     "Docs":         { "agent": "documentarian",     "next": "Skeptic", "provider": "local" }
@@ -14,8 +15,9 @@
     "architecture": ["Architecture", "Skeptic", "Done"],
     "chore":        ["Engineering", "Skeptic", "Done"],
     "docs":         ["Docs", "Skeptic", "Done"],
-    "polish":       ["Engineering", "QA", "Skeptic", "Done"]
+    "design":       ["Design", "Skeptic", "Done"],
+    "polish":       ["Design", "Engineering", "QA", "Skeptic", "Done"]
   },
   "default_route": "Engineering",
-  "non_dispatchable": ["Review", "Done", "Backlog"]
+  "non_dispatchable": ["Review", "Done", "Backlog", "Stuck"]
 }
