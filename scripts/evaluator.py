@@ -154,8 +154,11 @@ def gate_llm_spot_check(issue_title, issue_body, diff_text, claude_bin):
             return True, f"LLM: {result.stdout.strip()}"
         return False, f"LLM: {result.stdout.strip()}"
     except (subprocess.TimeoutExpired, OSError) as e:
-        log.warning("LLM spot-check failed: %s (passing by default)", e)
-        return True, f"LLM spot-check unavailable: {e}"
+        # Fail-closed: masking infra failures as PASS is how unreviewed work
+        # reaches Done. If the spot-check CLI is unavailable, route to Review
+        # so a human decides whether to bypass or fix the infra.
+        log.warning("LLM spot-check failed: %s — failing gate (requires human review)", e)
+        return False, f"LLM spot-check unavailable ({type(e).__name__}) — requires human review"
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +301,7 @@ def extract_verdict(output_text):
 
 PIPELINE_TEMPLATES = {
     "bug":          ["Engineering", "QA", "Skeptic", "Done"],
-    "feature":      ["Research", "Skeptic", "Architecture", "Skeptic", "Engineering", "QA", "Docs", "Skeptic", "Done"],
+    "feature":      ["Research", "Architecture", "Engineering", "QA", "Docs", "Skeptic", "Done"],
     "research":     ["Research", "Skeptic", "Done"],
     "architecture": ["Architecture", "Skeptic", "Done"],
     "chore":        ["Engineering", "Skeptic", "Done"],
