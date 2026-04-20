@@ -10,6 +10,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -50,6 +51,42 @@ CLAUDE_BIN = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Concurrency budget tracker
+# ---------------------------------------------------------------------------
+
+class BudgetTracker:
+    """Shared concurrency-slot tracker across dispatch phases.
+
+    Initialized from ``len(state["running"])`` so the starting count reflects
+    agents already alive.  Each phase calls ``reserve()`` before spawning and
+    ``release()`` on spawn failure so the count stays in sync with
+    ``state["running"]`` without either phase re-reading the dict mid-loop.
+
+    At end-of-cycle ``tracker.count`` should equal ``len(state["running"])``.
+    """
+
+    def __init__(self, max_concurrent: int, running_count: int) -> None:
+        self.max_concurrent = max_concurrent
+        self._count = running_count
+
+    def can_dispatch(self) -> bool:
+        """Return True when a free concurrency slot is available."""
+        return self._count < self.max_concurrent
+
+    def reserve(self) -> None:
+        """Claim one slot (call before adding to state["running"])."""
+        self._count += 1
+
+    def release(self) -> None:
+        """Free one slot (call when spawn fails before the running entry is added)."""
+        self._count -= 1
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+
 def load_config():
     with open(CONFIG_DIR / "dispatcher.json") as f:
         cfg = json.load(f)
@@ -75,13 +112,18 @@ def safe_id(cid: str) -> str:
     return cid.replace("/", "-")
 
 
-def resolve_project_dir(projects_root, repo_name):
+def resolve_project_dir(projects_root, repo_name, overrides=None):
     """Find the local directory for a GitHub repo name.
 
-    Tries: exact match, case-insensitive match, nested subdirectories
-    (e.g., parent-dir/my-repo for repo my-repo-public).
+    Tries: explicit override, exact match, case-insensitive match,
+    nested subdirectories (e.g., parent-dir/my-repo for repo my-repo-public).
     Returns the path string or None.
     """
+    if overrides and repo_name in overrides:
+        override = Path(os.path.expanduser(overrides[repo_name]))
+        if override.is_dir() and (override / ".git").exists():
+            return str(override)
+
     root = Path(projects_root)
 
     # Exact match
@@ -102,7 +144,7 @@ def resolve_project_dir(projects_root, repo_name):
     for suffix in ("-repo", "-app", "-ios", "-mac", "-web", "-api"):
         stripped = repo_name.removesuffix(suffix)
         if stripped != repo_name:
-            result = resolve_project_dir(projects_root, stripped)
+            result = resolve_project_dir(projects_root, stripped, overrides)
             if result:
                 return result
 
@@ -171,6 +213,70 @@ def save_state(state):
     with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
     tmp.rename(STATE_FILE)
+
+
+def migrate_state(state):
+    """Upgrade state.json schema in-place; safe to call on every load.
+
+    Two migration passes run unconditionally on each dispatcher boot:
+
+    1. **Skeptic rejection counters** — moved from ``pipeline_state[cid]``
+       to the top-level ``skeptic_rejections`` dict.  Counter-only entries
+       (those without a ``pipeline`` key) are dropped so the pipeline reader
+       never hits a KeyError.
+
+    2. **Pipeline unification** — ``pipeline`` / ``pipeline_index`` were
+       previously duplicated across both ``state["running"][cid]`` and
+       ``state["pipeline_state"][cid]``, risking silent drift between the two
+       copies.  ``pipeline_state`` is now the single authoritative source;
+       this pass moves legacy ``pipeline`` keys out of ``running`` entries
+       into ``pipeline_state`` (without overwriting an existing entry).
+       All harvest and retry code paths read exclusively from ``pipeline_state``.
+
+    Returns the mutated *state* dict (same object as input) for convenience.
+    """
+    # Skeptic rejection counters used to be stored inside pipeline_state[cid],
+    # which caused KeyError when the pipeline reader hit a counter-only entry.
+    # Move counters to their own top-level dict and drop counter-only entries.
+    ps = state.setdefault("pipeline_state", {})
+    rej = state.setdefault("skeptic_rejections", {})
+    moved = 0
+    dropped = 0
+    for cid in list(ps.keys()):
+        entry = ps[cid]
+        if isinstance(entry, dict) and "skeptic_rejections" in entry:
+            rej[cid] = entry.pop("skeptic_rejections")
+            moved += 1
+        if not (isinstance(entry, dict) and "pipeline" in entry):
+            del ps[cid]
+            dropped += 1
+    if moved or dropped:
+        log.info("State migration: moved %d counter(s), dropped %d counter-only entrie(s)",
+                 moved, dropped)
+
+    # Consolidate pipeline tracking to a single source of truth: pipeline_state.
+    # Previously, `pipeline` / `pipeline_index` were duplicated in both
+    # state["running"][cid] and state["pipeline_state"][cid], creating drift risk.
+    # Move any legacy copies out of running entries into pipeline_state, which is
+    # now authoritative. Harvest and retry code paths read from pipeline_state only.
+    consolidated = 0
+    for cid, entry in state.get("running", {}).items():
+        if not isinstance(entry, dict):
+            continue
+        pipeline = entry.pop("pipeline", None)
+        pipeline_idx = entry.pop("pipeline_index", None)
+        if pipeline is not None and cid not in ps:
+            # pipeline_state is authoritative — don't overwrite an existing entry.
+            ps[cid] = {
+                "pipeline": pipeline,
+                "pipeline_index": pipeline_idx if pipeline_idx is not None else 0,
+            }
+            consolidated += 1
+    if consolidated:
+        log.info("State migration: consolidated %d running-entry pipeline(s) into pipeline_state",
+                 consolidated)
+
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +376,8 @@ def gh_issue_close(repo, issue_number):
     )
 
 
-def create_followup_issues(followup_text, config, fields_cache, source_cid):
+def create_followup_issues(followup_text, config, fields_cache, source_cid,
+                           source_parent=None):
     """Parse FOLLOWUP/ISSUES_CREATED field and create GitHub issues on the board.
 
     Format (pipe-delimited, one issue per line):
@@ -279,6 +386,11 @@ def create_followup_issues(followup_text, config, fields_cache, source_cid):
         Issue title | Brief description
 
     If repo-name is omitted, defaults to the source issue's repo.
+
+    source_parent: dict with keys 'repo' and 'number' for the Epic that owns
+    the source issue.  When provided, each new issue is linked as a sub-issue
+    of that Epic via the addSubIssue GraphQL mutation.  Linkage failure is
+    non-fatal — the issue is still created and added to the board.
     """
     if not followup_text or followup_text.strip().lower() in ("none", "n/a", ""):
         return []
@@ -292,62 +404,104 @@ def create_followup_issues(followup_text, config, fields_cache, source_cid):
     if len(parts) == 3:
         default_repo = f"{parts[0]}/{parts[1]}"
 
+    # Pattern for already-created GitHub issue URLs (e.g. from Skeptic ISSUES_CREATED field).
+    # These must NOT be re-created as new issues — they already exist.
+    _gh_issue_url_re = re.compile(
+        r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/\d+'
+    )
+
     created = []
     for raw_line in followup_text.splitlines():
-        line = raw_line.strip().strip("-").strip()
-        if not line or line.lower() == "none":
-            continue
+        # ISSUES_CREATED may be comma-separated on one line; split those too.
+        for raw_item in raw_line.split(","):
+            line = raw_item.strip().strip("-").strip()
+            if not line or line.lower() == "none":
+                continue
 
-        segments = [s.strip() for s in line.split("|")]
-        if len(segments) >= 3:
-            repo_hint, title, body = segments[0], segments[1], segments[2]
-            # repo_hint could be "owner/repo" or just "repo"
-            repo = f"{owner}/{repo_hint}" if "/" not in repo_hint else repo_hint
-        elif len(segments) == 2:
-            repo = default_repo
-            title, body = segments[0], segments[1]
-        elif len(segments) == 1:
-            repo = default_repo
-            title = segments[0]
-            body = f"Follow-up from {source_cid}"
-        else:
-            continue
+            # Guard: if this entry is already a GitHub issue URL, the issue was
+            # created by the agent directly (e.g. Skeptic via CLI).  Adding it to
+            # `created` lets the caller report it; creating a *new* issue would
+            # produce a duplicate with the URL as its title (see half-bakery#204).
+            if _gh_issue_url_re.fullmatch(line):
+                log.info("Skipping creation — entry is an existing issue URL: %s", line)
+                created.append(line)
+                continue
 
-        if not title:
-            continue
+            segments = [s.strip() for s in line.split("|")]
+            if len(segments) >= 3:
+                repo_hint, title, body = segments[0], segments[1], segments[2]
+                # repo_hint could be "owner/repo" or just "repo"
+                repo = f"{owner}/{repo_hint}" if "/" not in repo_hint else repo_hint
+            elif len(segments) == 2:
+                repo = default_repo
+                title, body = segments[0], segments[1]
+            elif len(segments) == 1:
+                repo = default_repo
+                title = segments[0]
+                body = f"Follow-up from {source_cid}"
+            else:
+                continue
 
-        body_full = f"{body}\n\n_Auto-created from agent output on {source_cid}_"
+            if not title:
+                continue
 
-        if DRY_RUN:
-            log.info("[DRY RUN] Would create issue in %s: %s", repo, title)
-            created.append(f"{repo}: {title}")
-            continue
+            body_full = f"{body}\n\n_Auto-created from agent output on {source_cid}_"
 
-        result = subprocess.run(
-            ["gh", "issue", "create", "--repo", repo,
-             "--title", title, "--body", body_full],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            log.warning("Failed to create follow-up issue '%s' in %s: %s",
-                        title, repo, result.stderr.strip())
-            continue
+            if DRY_RUN:
+                log.info("[DRY RUN] Would create issue in %s: %s", repo, title)
+                created.append(f"{repo}: {title}")
+                continue
 
-        issue_url = result.stdout.strip()
-        log.info("Created follow-up issue: %s", issue_url)
+            result = subprocess.run(
+                ["gh", "issue", "create", "--repo", repo,
+                 "--title", title, "--body", body_full],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                log.warning("Failed to create follow-up issue '%s' in %s: %s",
+                            title, repo, result.stderr.strip())
+                continue
 
-        # Add to project board and move to Ready
-        add_result = subprocess.run(
-            ["gh", "project", "item-add", str(project_number),
-             "--owner", owner, "--url", issue_url],
-            capture_output=True, text=True,
-        )
-        if add_result.returncode == 0:
-            log.info("Added follow-up issue to board: %s", issue_url)
-        else:
-            log.warning("Could not add %s to board: %s", issue_url, add_result.stderr.strip())
+            issue_url = result.stdout.strip()
+            log.info("Created follow-up issue: %s", issue_url)
 
-        created.append(issue_url)
+            # Link as sub-issue BEFORE adding to the project board.
+            # GitHub's addSubIssue mutation auto-enrolls the child in any project
+            # the parent Epic belongs to (as a "group" sub-item with no Status).
+            # By linking first, the subsequent project item-add operates on that
+            # already-enrolled entry rather than creating a second duplicate item
+            # that would appear as "Group selected" alongside the proper board entry.
+            if source_parent:
+                p_repo = source_parent.get("repo", "")
+                p_num = source_parent.get("number")
+                if p_repo and p_num:
+                    if not link_as_sub_issue(p_repo, p_num, issue_url):
+                        log.warning(
+                            "Could not link %s as sub-issue of Epic #%d in %s "
+                            "(stale parent or permission issue) — issue created but not nested",
+                            issue_url, p_num, p_repo,
+                        )
+
+            # Add to project board (or update the auto-enrolled entry) and set Status=Ready.
+            add_result = subprocess.run(
+                ["gh", "project", "item-add", str(project_number),
+                 "--owner", owner, "--url", issue_url, "--format", "json"],
+                capture_output=True, text=True,
+            )
+            if add_result.returncode == 0:
+                log.info("Added follow-up issue to board: %s", issue_url)
+                try:
+                    new_item_id = json.loads(add_result.stdout).get("id")
+                except (json.JSONDecodeError, AttributeError):
+                    new_item_id = None
+                if new_item_id:
+                    # Set Status=Ready so the dispatcher picks it up next cycle.
+                    if not move_issue_to_column(fields_cache, new_item_id, "Ready"):
+                        log.warning("Added %s to board but failed to set Status=Ready", issue_url)
+            else:
+                log.warning("Could not add %s to board: %s", issue_url, add_result.stderr.strip())
+
+            created.append(issue_url)
 
     return created
 
@@ -408,6 +562,80 @@ def fetch_epic_summary(repo, issue_number):
         }
     except (KeyError, TypeError):
         return None
+
+
+def resolve_issue_node_id(repo, issue_number):
+    """Return the GraphQL node ID for a GitHub issue (e.g. 'I_kwDO...' ).
+
+    Required by addSubIssue mutation, which takes node IDs not integers.
+    Returns None on failure.
+    """
+    owner, name = repo.split("/", 1)
+    query = f'''query {{
+        repository(owner: "{owner}", name: "{name}") {{
+            issue(number: {issue_number}) {{
+                id
+            }}
+        }}
+    }}'''
+    data = gh_graphql(query)
+    if not data:
+        return None
+    try:
+        return data["data"]["repository"]["issue"]["id"]
+    except (KeyError, TypeError):
+        return None
+
+
+def link_as_sub_issue(parent_repo, parent_number, new_issue_url):
+    """Attach new_issue_url as a sub-issue of parent_repo#parent_number.
+
+    Calls the GitHub GraphQL addSubIssue mutation.  Failure is non-fatal —
+    the issue exists even if the linkage fails; callers should warn and continue.
+
+    Returns True if linkage succeeded, False otherwise.
+    """
+    # Parse new issue URL: https://github.com/owner/repo/issues/NUMBER
+    url_parts = new_issue_url.rstrip("/").split("/")
+    if len(url_parts) < 2:
+        log.warning("link_as_sub_issue: cannot parse issue URL %s", new_issue_url)
+        return False
+    try:
+        new_number = int(url_parts[-1])
+        new_repo = f"{url_parts[-4]}/{url_parts[-3]}"
+    except (ValueError, IndexError):
+        log.warning("link_as_sub_issue: malformed issue URL %s", new_issue_url)
+        return False
+
+    parent_id = resolve_issue_node_id(parent_repo, parent_number)
+    if not parent_id:
+        log.warning("link_as_sub_issue: could not resolve node ID for %s#%d",
+                    parent_repo, parent_number)
+        return False
+
+    new_issue_id = resolve_issue_node_id(new_repo, new_number)
+    if not new_issue_id:
+        log.warning("link_as_sub_issue: could not resolve node ID for %s#%d",
+                    new_repo, new_number)
+        return False
+
+    mutation = f'''mutation {{
+        addSubIssue(input: {{ issueId: "{parent_id}", subIssueId: "{new_issue_id}" }}) {{
+            issue {{ number }}
+            subIssue {{ number }}
+        }}
+    }}'''
+    result = gh_graphql(mutation)
+    if result is None:
+        return False
+    try:
+        sub_num = result["data"]["addSubIssue"]["subIssue"]["number"]
+        parent_num = result["data"]["addSubIssue"]["issue"]["number"]
+        log.info("Linked followup #%d as sub-issue of Epic #%d", sub_num, parent_num)
+        return True
+    except (KeyError, TypeError) as exc:
+        log.warning("link_as_sub_issue: unexpected mutation response: %s", exc)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -479,11 +707,14 @@ def get_project_fields(config):
 # Board operations
 # ---------------------------------------------------------------------------
 
-def poll_board(config, fields_cache, routes):
-    """Query the board for dispatchable issues. Paginates to get ALL items."""
-    owner = config["github_repo"].split("/")[0]
-    project_num = config["github_project_number"]
+def paginate_project_items(owner: str, project_num: int, node_fields: str) -> list:
+    """Fetch all ProjectV2 items via cursor pagination, returning raw node list.
 
+    ``node_fields`` is a plain GraphQL fragment (literal ``{`` / ``}``) for
+    the per-node fields the caller cares about — everything that would appear
+    inside ``nodes { ... }``.  Returns an empty list if the first request
+    fails; the caller decides whether to treat that as a warning or error.
+    """
     all_nodes = []
     cursor = None
     while True:
@@ -494,34 +725,7 @@ def poll_board(config, fields_cache, routes):
                     items(first: 100{after}) {{
                         pageInfo {{ hasNextPage endCursor }}
                         nodes {{
-                            id
-                            content {{
-                                ... on Issue {{
-                                    number
-                                    title
-                                    state
-                                    body
-                                    repository {{ name nameWithOwner }}
-                                    subIssues(first: 20) {{
-                                        nodes {{ number title state }}
-                                        totalCount
-                                    }}
-                                    subIssuesSummary {{ completed total percentCompleted }}
-                                    parent {{ number title state body repository {{ nameWithOwner }} }}
-                                }}
-                            }}
-                            fieldValues(first: 15) {{
-                                nodes {{
-                                    ... on ProjectV2ItemFieldSingleSelectValue {{
-                                        name
-                                        field {{ ... on ProjectV2SingleSelectField {{ name }} }}
-                                    }}
-                                    ... on ProjectV2ItemFieldTextValue {{
-                                        text
-                                        field {{ ... on ProjectV2Field {{ name }} }}
-                                    }}
-                                }}
-                            }}
+{node_fields}
                         }}
                     }}
                 }}
@@ -529,15 +733,104 @@ def poll_board(config, fields_cache, routes):
         }}'''
         data = gh_graphql(query)
         if not data:
+            log.warning("paginate_project_items: gh_graphql returned no data; stopping pagination")
             break
-
         items_data = data["data"]["user"]["projectV2"]["items"]
         all_nodes.extend(items_data["nodes"])
-
         if items_data["pageInfo"]["hasNextPage"]:
             cursor = items_data["pageInfo"]["endCursor"]
         else:
             break
+    return all_nodes
+
+
+def poll_board(config, fields_cache, routes):
+    """Query the board for dispatchable issues. Paginates to get ALL items."""
+    owner = config["github_repo"].split("/")[0]
+    project_num = config["github_project_number"]
+
+    node_fields = """\
+                            id
+                            content {
+                                ... on Issue {
+                                    number
+                                    title
+                                    state
+                                    body
+                                    repository { name nameWithOwner }
+                                    subIssues(first: 20) {
+                                        nodes { number title state }
+                                        totalCount
+                                    }
+                                    subIssuesSummary { completed total percentCompleted }
+                                    parent { number title state body repository { nameWithOwner } }
+                                }
+                            }
+                            fieldValues(first: 15) {
+                                nodes {
+                                    ... on ProjectV2ItemFieldSingleSelectValue {
+                                        name
+                                        field { ... on ProjectV2SingleSelectField { name } }
+                                    }
+                                    ... on ProjectV2ItemFieldTextValue {
+                                        text
+                                        field { ... on ProjectV2Field { name } }
+                                    }
+                                }
+                            }"""
+    all_nodes = paginate_project_items(owner, project_num, node_fields)
+
+    # ---- Epic-dictates-dispatch preparation ----
+    # The user's prioritization rule: the Epic's Status gates all descendants.
+    # If an Epic (or any ancestor) is not in "Ready", its entire subtree is
+    # paused regardless of individual issue status. Orphan issues (no parent
+    # Epic) are never dispatched — every story must live under an Epic.
+    #
+    # Build two lookups from the full board so we can walk each item's
+    # ancestor chain without additional GraphQL queries.
+    status_by_cid = {}   # canonical_id → current Status on the board
+    parent_by_cid = {}   # canonical_id → canonical_id of immediate parent
+    for node in all_nodes:
+        content = node.get("content") or {}
+        if not content:
+            continue
+        repo_full = (content.get("repository") or {}).get("nameWithOwner")
+        if not repo_full or content.get("number") is None:
+            continue
+        cid = canonical_id(repo_full, content["number"])
+        status_val = None
+        for fv in node.get("fieldValues", {}).get("nodes", []):
+            if (fv.get("field") or {}).get("name") == "Status" and "name" in fv:
+                status_val = fv["name"]
+        status_by_cid[cid] = status_val
+        parent = content.get("parent")
+        if parent and parent.get("number") is not None:
+            p_repo = (parent.get("repository") or {}).get("nameWithOwner") or repo_full
+            parent_by_cid[cid] = canonical_id(p_repo, parent["number"])
+
+    def _ancestors_all_ready(cid, max_hops=5):
+        """Return (ok, blocker_cid). ok=True iff every ancestor up the chain
+        has Status=Ready. blocker_cid is the first non-Ready ancestor."""
+        seen = set()
+        cur = cid
+        for _ in range(max_hops):
+            parent_cid = parent_by_cid.get(cur)
+            if parent_cid is None:
+                return True, None
+            if parent_cid in seen:
+                return False, parent_cid  # cycle
+            seen.add(parent_cid)
+            if parent_cid not in status_by_cid:
+                # Parent exists in GitHub's hierarchy but is not on the board —
+                # no board-level gate configured for this ancestor; allow dispatch.
+                return True, None
+            if status_by_cid.get(parent_cid) != "Ready":
+                return False, parent_cid
+            cur = parent_cid
+        return False, "__max_hops__"
+
+    skipped_orphans = 0
+    skipped_by_epic = {}  # {blocker_cid: count}
 
     dispatchable_columns = set(routes["columns"].keys()) | {"Ready"}
     items = []
@@ -560,6 +853,19 @@ def poll_board(config, fields_cache, routes):
         issue_repo = repo_info.get("nameWithOwner") or config["github_repo"]
 
         if status and status in dispatchable_columns:
+            # ---- Epic-dictates-dispatch filter ----
+            # Skip this filter for Epics themselves (they're containers, not
+            # work units — the Epic-skip at dispatch time handles them).
+            is_epic = (content.get("subIssues") or {}).get("totalCount", 0) > 0
+            cid_current = canonical_id(issue_repo, content["number"])
+            if not is_epic:
+                if cid_current not in parent_by_cid:
+                    skipped_orphans += 1
+                    continue
+                ok, blocker = _ancestors_all_ready(cid_current)
+                if not ok:
+                    skipped_by_epic[blocker] = skipped_by_epic.get(blocker, 0) + 1
+                    continue
             sub_issues_data = content.get("subIssues") or {}
             summary_data = content.get("subIssuesSummary") or {}
             parent_data = content.get("parent")
@@ -589,6 +895,16 @@ def poll_board(config, fields_cache, routes):
                 "sub_issues_completed": summary_data.get("completed", 0),
                 "parent": parent,
             })
+
+    # ---- Epic-gate visibility: one log line per cycle so the user can see
+    # what got filtered and why (paused Epic vs. orphan). ----
+    if skipped_orphans:
+        log.info("Epic-gate: %d orphan issue(s) skipped — no parent Epic assigned",
+                 skipped_orphans)
+    for blocker_cid, count in sorted(skipped_by_epic.items(), key=lambda kv: -kv[1]):
+        blocker_status = status_by_cid.get(blocker_cid, "?") if blocker_cid != "__max_hops__" else "(chain too deep)"
+        log.info("Epic-gate: %d issue(s) under ancestor %s (Status=%s) — skipped",
+                 count, blocker_cid, blocker_status)
 
     return items
 
@@ -670,6 +986,30 @@ def auto_route(item, routes):
 # Git worktree management
 # ---------------------------------------------------------------------------
 
+def get_default_branch(project_dir):
+    """Return the default branch name (e.g. 'main') for this repo.
+
+    Resolves via refs/remotes/origin/HEAD; falls back to probing 'main' then
+    'master' so air-gapped or newly-cloned repos without a remote tracking ref
+    still work correctly.
+    """
+    result = subprocess.run(
+        ["git", "-C", project_dir, "symbolic-ref", "refs/remotes/origin/HEAD"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        # e.g. "refs/remotes/origin/main" → "main"
+        return result.stdout.strip().split("/")[-1]
+    for candidate in ("main", "master"):
+        check = subprocess.run(
+            ["git", "-C", project_dir, "rev-parse", "--verify", candidate],
+            capture_output=True, text=True,
+        )
+        if check.returncode == 0:
+            return candidate
+    return "main"
+
+
 def create_worktree(project_dir, issue_number, repo_name=None):
     """Create a git worktree for this issue in the target project."""
     # Use repo_name-issue_number to avoid collisions across repos
@@ -711,14 +1051,32 @@ def create_worktree(project_dir, issue_number, repo_name=None):
                       branch_name, del_result.stderr.strip())
             return None
 
+    default_branch = get_default_branch(project_dir)
     result = subprocess.run(
         ["git", "-C", project_dir, "worktree", "add",
-         str(worktree_path), "-b", branch_name],
+         str(worktree_path), "-b", branch_name, default_branch],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
         log.error("Failed to create worktree: %s",
                   (result.stderr or result.stdout).strip())
+        # `git worktree add -b` creates the branch before the directory, so a
+        # mid-command failure can leave the branch orphaned. Clean up now so
+        # the next cycle doesn't waste a retry tripping over it.
+        branch_check = subprocess.run(
+            ["git", "-C", project_dir, "rev-parse", "--verify", branch_name],
+            capture_output=True, text=True,
+        )
+        if branch_check.returncode == 0:
+            log.warning("Cleaning up orphan branch %s left by failed worktree add", branch_name)
+            subprocess.run(
+                ["git", "-C", project_dir, "worktree", "prune"],
+                capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["git", "-C", project_dir, "branch", "-D", branch_name],
+                capture_output=True, text=True,
+            )
         return None
 
     return str(worktree_path), branch_name
@@ -751,7 +1109,48 @@ def merge_worktree(project_dir, branch_name):
     if result.returncode != 0:
         return False, f"Branch {branch_name} does not exist"
 
-    # Pre-check 3: Auto-commit dirty working tree so merges start clean.
+    # Pre-check 3: Ensure we're on the default branch before merging.
+    # Merging into a feature branch causes conflicts when both the feature branch
+    # and the agent branch modified the same files.
+    # See: https://github.com/justintormey/half-bakery/issues/193
+    default_branch = get_default_branch(project_dir)
+    current_branch_result = subprocess.run(
+        ["git", "-C", project_dir, "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True,
+    )
+    current_branch = current_branch_result.stdout.strip()
+    if current_branch != default_branch:
+        status_check = subprocess.run(
+            ["git", "-C", project_dir, "status", "--porcelain"],
+            capture_output=True, text=True,
+        )
+        dirty_lines = [l for l in status_check.stdout.splitlines() if not l.startswith("??")]
+        if dirty_lines:
+            log.warning(
+                "Project dir %s is on branch '%s' with %d dirty file(s) — stashing before "
+                "switching to '%s'. Commit these changes manually if they are intentional.",
+                project_dir, current_branch, len(dirty_lines), default_branch,
+            )
+            subprocess.run(
+                ["git", "-C", project_dir, "stash", "push", "-u", "-m",
+                 f"dispatcher: stashed {current_branch} before merge to {default_branch}"],
+                capture_output=True, text=True,
+            )
+        else:
+            log.warning(
+                "Project dir %s is on branch '%s', not '%s' — switching before merge",
+                project_dir, current_branch, default_branch,
+            )
+        checkout_result = subprocess.run(
+            ["git", "-C", project_dir, "checkout", default_branch],
+            capture_output=True, text=True,
+        )
+        if checkout_result.returncode != 0:
+            return False, (
+                f"Failed to checkout {default_branch}: {checkout_result.stderr.strip()}"
+            )
+
+    # Pre-check 4: Auto-commit dirty working tree so merges start clean.
     # IMPORTANT: Config files are protected — if any file under config/ is dirty,
     # we reset it to HEAD before committing.  Auto-commits must never clobber
     # intentional architectural decisions made by agents or humans.
@@ -761,11 +1160,14 @@ def merge_worktree(project_dir, branch_name):
         capture_output=True, text=True,
     )
     if status_result.stdout.strip():
-        # Identify dirty files under config/ and reset them to HEAD
+        # Identify dirty tracked files under config/ and reset them to HEAD.
+        # Untracked files (status "??") are excluded: git checkout HEAD silently
+        # does nothing for them, and they would then be staged by git add -A.
+        # See: https://github.com/justintormey/half-bakery/issues/121
         dirty_config_files = [
             line[3:]  # strip the two-char status prefix + space
             for line in status_result.stdout.splitlines()
-            if line[3:].startswith("config/")
+            if line[3:].startswith("config/") and not line.startswith("??")
         ]
         if dirty_config_files:
             log.warning(
@@ -773,10 +1175,20 @@ def merge_worktree(project_dir, branch_name):
                 "to prevent clobbering intentional config changes: %s",
                 len(dirty_config_files), project_dir, dirty_config_files,
             )
-            subprocess.run(
+            reset_result = subprocess.run(
                 ["git", "-C", project_dir, "checkout", "HEAD", "--"] + dirty_config_files,
                 capture_output=True, text=True,
             )
+            if reset_result.returncode != 0:
+                log.error(
+                    "Config-protection reset failed (rc=%d) in %s: %s — aborting merge "
+                    "to prevent clobbering protected config files.",
+                    reset_result.returncode, project_dir, reset_result.stderr.strip(),
+                )
+                return False, (
+                    f"Config-protection reset failed (rc={reset_result.returncode}): "
+                    f"{reset_result.stderr.strip()}"
+                )
 
         # Re-check after resetting protected files — may be clean now
         status_result2 = subprocess.run(
@@ -805,7 +1217,12 @@ def merge_worktree(project_dir, branch_name):
         if result.returncode == 0:
             return True, None
 
-        error_msg = result.stderr.strip()
+        # git writes merge conflict details to stdout ("CONFLICT (content): ...",
+        # "Automatic merge failed; fix conflicts...") and errors to stderr.
+        # Combine both so the log is actually useful for debugging.
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        error_msg = " | ".join(p for p in (stderr, stdout) if p) or f"exit={result.returncode} (no output)"
         log.error("Merge failed for %s (attempt %d): %s", branch_name, attempt + 1, error_msg)
 
         subprocess.run(
@@ -844,6 +1261,12 @@ def cleanup_worktree(project_dir, issue_number, repo_name=None):
             try:
                 shutil.rmtree(worktree_path)
                 log.info("Removed worktree directory manually: %s", worktree_path)
+            except FileNotFoundError:
+                # git's `worktree remove` actually deletes the working dir first,
+                # then fails on its metadata ref (e.g., EINTR on the lock file).
+                # The directory is already gone — `git worktree prune` below
+                # handles the stale metadata. This is a success, not an error.
+                log.info("Worktree directory already removed by git: %s", worktree_path)
             except OSError as e:
                 log.error("Failed to rm worktree directory %s: %s", worktree_path, e)
                 return False
@@ -1009,9 +1432,9 @@ do not attempt to do work assigned to other sub-issues.
                  agent_type, item["issue_number"], worktree_path)
         return None
 
-    # Select model per agent type (default: opus)
+    # Select model per agent type (default: sonnet)
     agent_models = config.get("agent_models", {})
-    model = agent_models.get(agent_type, "opus")
+    model = agent_models.get(agent_type, "sonnet")
 
     cmd = [
         CLAUDE_BIN, "--print",
@@ -1279,28 +1702,25 @@ def phase_timeout_check(state, config, fields_cache):
             save_state(state)
 
 
-def phase_retry_queue(state, config, fields_cache, routes):
+def phase_retry_queue(state, config, fields_cache, routes, budget: "BudgetTracker"):
     """Re-dispatch issues from the retry queue with failure context."""
     retry_queue = state.get("retry_queue", {})
     if not retry_queue:
         return
 
-    budget = get_budget_profile(config)
-    max_concurrent = budget["max_concurrent"]
-    running_count = len(state["running"])
-
     for cid, retry_info in list(retry_queue.items()):
         issue_number = int(cid.split("/")[-1])
-        if running_count >= max_concurrent:
+        if not budget.can_dispatch():
             break
 
         log.info("Retrying issue %s (attempt %d, prior: %s)",
                  cid, retry_info["retry_count"], retry_info["prior_failure"])
 
         target_project = retry_info.get("target_project", "")
-        project_dir = resolve_project_dir(config["projects_root"], target_project)
+        project_dir = resolve_project_dir(config["projects_root"], target_project,
+                                          config.get("project_overrides"))
         if not project_dir:
-            log.warning("Retry: project dir not found for %s, moving to Stuck", target_project)
+            log.warning("Retry: project dir not found for %s, moving to Review", target_project)
             move_issue_to_column(fields_cache, retry_info.get("item_id", ""), "Review")
             del retry_queue[cid]
             continue
@@ -1330,6 +1750,7 @@ def phase_retry_queue(state, config, fields_cache, routes):
         }
 
         # If force_provider is set (e.g., local agent failed), bypass routing
+        budget.reserve()
         if retry_info.get("force_provider") == "claude":
             log.info("Issue %s: forced provider 'claude' on retry", cid)
             pid = spawn_agent(config, routes, item, worktree_path)
@@ -1337,6 +1758,7 @@ def phase_retry_queue(state, config, fields_cache, routes):
         else:
             pid, used_provider = spawn_for_provider(config, routes, item, worktree_path)
         if pid is None:
+            budget.release()
             cleanup_worktree(project_dir, issue_number, target_project)
             del retry_queue[cid]
             continue
@@ -1354,28 +1776,25 @@ def phase_retry_queue(state, config, fields_cache, routes):
             "retry_count": retry_info["retry_count"],
             "title": item["title"],
             "body": item["body"],
-            "pipeline": retry_info.get("pipeline"),
-            "pipeline_index": retry_info.get("pipeline_index"),
             "provider": used_provider,
         }
+        # pipeline/pipeline_index live in state["pipeline_state"][cid] — already
+        # persisted by the prior harvest cycle that enqueued this retry.
         if retry_info.get("parent_issue"):
             entry["parent_issue"] = retry_info["parent_issue"]
         state["running"][cid] = entry
-        running_count += 1
         del retry_queue[cid]
         log.info("Retried issue %s (PID %d, provider: %s)", cid, pid, used_provider)
 
     save_state(state)
 
 
-def phase_poll_and_dispatch(state, config, fields_cache, routes):
+def phase_poll_and_dispatch(state, config, fields_cache, routes, budget: "BudgetTracker"):
     """Poll the board and dispatch agents for ready issues.
 
     v3: Budget-aware concurrency, pipeline classification, big-build deferral.
     """
-    budget = get_budget_profile(config)
-    max_concurrent = budget["max_concurrent"]
-    running_count = len(state["running"])
+    cfg_budget = get_budget_profile(config)
 
     # Usage-aware throttling: check actual consumption
     usage = get_usage_status()
@@ -1383,18 +1802,20 @@ def phase_poll_and_dispatch(state, config, fields_cache, routes):
         log.warning("Usage: PAUSED — %s", usage["reason"])
         return
     if usage["should_throttle"]:
-        max_concurrent = max(1, max_concurrent - 1)
+        budget.max_concurrent = max(1, budget.max_concurrent - 1)
         log.info("Usage: throttled to max_concurrent=%d — %s",
-                 max_concurrent, usage["reason"])
+                 budget.max_concurrent, usage["reason"])
 
     log.info("Budget: %s | window=%s%% (%d/%d output tokens, %d sessions)",
-             get_budget_summary(state), usage["window_pct"],
+             get_budget_summary(state, config), usage["window_pct"],
              usage["window_output_tokens"], usage["window_output_ceiling"],
              usage["window_sessions"])
 
-    if running_count >= max_concurrent:
+    # budget.can_dispatch() reflects slots already consumed by phase_retry_queue
+    # this cycle, so no need to re-read len(state["running"]) here.
+    if not budget.can_dispatch():
         log.info("At max concurrency (%d/%d), skipping poll",
-                 running_count, max_concurrent)
+                 budget.count, budget.max_concurrent)
         return
 
     items = poll_board(config, fields_cache, routes)
@@ -1446,7 +1867,7 @@ def phase_poll_and_dispatch(state, config, fields_cache, routes):
     for item in items:
         if item["canonical_id"] in running_issues:
             continue
-        if running_count >= max_concurrent:
+        if not budget.can_dispatch():
             break
 
         # Skip Epics — they are containers; only sub-issues get dispatched.
@@ -1459,8 +1880,8 @@ def phase_poll_and_dispatch(state, config, fields_cache, routes):
             )
             continue
 
-        # Skip items in non-dispatchable columns (Done, Review, Stuck, Backlog)
-        non_dispatchable = set(routes.get("non_dispatchable", ["Review", "Review", "Done", "Backlog"]))
+        # Skip items in non-dispatchable columns (Done, Review, Backlog)
+        non_dispatchable = set(routes.get("non_dispatchable", ["Review", "Done", "Backlog"]))
         if item["status"] in non_dispatchable:
             continue
 
@@ -1471,7 +1892,7 @@ def phase_poll_and_dispatch(state, config, fields_cache, routes):
             continue
 
         # Budget: defer big builds to off-hours
-        if should_defer_issue(item, budget):
+        if should_defer_issue(item, cfg_budget):
             log.info("Deferring big build issue #%d until aggressive mode",
                      item["issue_number"])
             continue
@@ -1480,7 +1901,7 @@ def phase_poll_and_dispatch(state, config, fields_cache, routes):
         if item["status"] == "Ready":
             # Check if this issue has existing pipeline state (was routed back by Skeptic)
             pipeline_state = state.get("pipeline_state", {}).get(item["canonical_id"])
-            if pipeline_state:
+            if pipeline_state and "pipeline" in pipeline_state:
                 pipeline = pipeline_state["pipeline"]
                 pipeline_idx = pipeline_state["pipeline_index"]
                 target_column = pipeline[pipeline_idx] if pipeline_idx < len(pipeline) else "Engineering"
@@ -1500,18 +1921,27 @@ def phase_poll_and_dispatch(state, config, fields_cache, routes):
                 move_issue_to_column(fields_cache, item["item_id"], "Done")
                 repo = item.get("issue_repo", config["github_repo"])
                 gh_issue_close(repo, item["issue_number"])
-                # Clean up pipeline state
+                # Clean up pipeline state, rejection counter, and merge-retry counter
                 state.get("pipeline_state", {}).pop(item["canonical_id"], None)
+                state.get("skeptic_rejections", {}).pop(item["canonical_id"], None)
+                state.get("merge_retries", {}).pop(item["canonical_id"], None)
                 continue
+
+            # Persist the pipeline assignment to pipeline_state (single source of truth).
+            # Harvest and retry paths read pipeline info from here — the running entry
+            # itself no longer carries pipeline/pipeline_index fields.
+            state.setdefault("pipeline_state", {})[item["canonical_id"]] = {
+                "pipeline": pipeline,
+                "pipeline_index": pipeline_idx,
+            }
 
             move_issue_to_column(fields_cache, item["item_id"], target_column)
             item["status"] = target_column
-            item["_pipeline"] = pipeline
-            item["_pipeline_index"] = pipeline_idx
 
         # Validate target project directory
         target_project = item["target_project"]
-        project_dir = resolve_project_dir(config["projects_root"], target_project)
+        project_dir = resolve_project_dir(config["projects_root"], target_project,
+                                          config.get("project_overrides"))
         if not project_dir:
             log.warning("Project directory for '%s' not found under %s, skipping issue #%d",
                         target_project, config["projects_root"], item["issue_number"])
@@ -1525,8 +1955,10 @@ def phase_poll_and_dispatch(state, config, fields_cache, routes):
         worktree_path, branch_name = result
 
         # Spawn agent (routes through provider config)
+        budget.reserve()
         pid, used_provider = spawn_for_provider(config, routes, item, worktree_path)
         if pid is None:
+            budget.release()
             cleanup_worktree(project_dir, item["issue_number"], target_project)
             continue
 
@@ -1544,38 +1976,14 @@ def phase_poll_and_dispatch(state, config, fields_cache, routes):
             "body": item.get("body", "")[:500],  # truncate for state file size
             "provider": used_provider,
         }
-        # Store pipeline for smart advancement
-        if item.get("_pipeline"):
-            entry["pipeline"] = item["_pipeline"]
-            entry["pipeline_index"] = item.get("_pipeline_index", 0)
+        # (pipeline/pipeline_index live in state["pipeline_state"][cid] now — no duplication here)
         # Store parent Epic reference so harvest can post progress updates.
         if item.get("parent"):
             entry["parent_issue"] = item["parent"]
         state["running"][item["canonical_id"]] = entry
         running_issues.add(item["canonical_id"])   # prevent duplicate dispatch same cycle
-        running_count += 1
         log.info("Dispatched %s to %s (PID %d)",
                  item["canonical_id"], item["status"], pid)
-
-
-def _extract_summary(output_text):
-    """Parse the ##SUMMARY##...##END## block from agent output.
-
-    Returns a dict with keys DONE, FILES, COMMITS, FOLLOWUP, or None if not found.
-    """
-    in_block = False
-    fields = {}
-    for line in output_text.splitlines():
-        stripped = line.strip()
-        if stripped == "##SUMMARY##":
-            in_block = True
-            continue
-        if stripped == "##END##":
-            break
-        if in_block and ":" in stripped:
-            key, _, value = stripped.partition(":")
-            fields[key.strip()] = value.strip()
-    return fields if fields else None
 
 
 def phase_harvest(state, config, fields_cache, routes):
@@ -1651,10 +2059,9 @@ def phase_harvest(state, config, fields_cache, routes):
                     "issue_repo": repo,
                     "target_project": info.get("project", ""),
                     "parent_issue": info.get("parent_issue"),
-                    "pipeline": info.get("pipeline"),
-                    "pipeline_index": info.get("pipeline_index"),
                     "force_provider": "claude",
                 }
+                # pipeline/pipeline_index stay in state["pipeline_state"][cid]
                 state.setdefault("retry_queue", {})[cid] = retry_info
                 output_file.unlink(missing_ok=True)
                 stderr_file.unlink(missing_ok=True)
@@ -1719,9 +2126,8 @@ def phase_harvest(state, config, fields_cache, routes):
                     "issue_repo": repo,
                     "target_project": info.get("project", ""),
                     "parent_issue": info.get("parent_issue"),
-                    "pipeline": info.get("pipeline"),
-                    "pipeline_index": info.get("pipeline_index"),
                 }
+                # pipeline/pipeline_index stay in state["pipeline_state"][cid]
                 state.setdefault("retry_queue", {})[cid] = retry_info
                 cleanup_worktree(project_dir, issue_number, info.get("project"))
                 output_file.unlink(missing_ok=True)
@@ -1734,11 +2140,25 @@ def phase_harvest(state, config, fields_cache, routes):
                 log.warning("Issue %s permanently stuck: %s", cid, eval_reason)
                 last_output = output_text[-1500:] if output_text else "(no output)"
                 gh_issue_comment(repo, issue_number,
-                    f"**Agent failed evaluation** — moving to Stuck.\n\n"
+                    f"**Agent permanently stuck** — moving to Stuck column.\n\n"
                     f"**Reason:** {eval_reason}\n"
                     f"**Retries exhausted:** {info.get('retry_count', 0)} attempts\n\n"
+                    f"Human intervention required. Remove the `[Stuck]` title prefix to "
+                    f"allow re-dispatch after addressing the root cause.\n\n"
                     f"<details><summary>Last output</summary>\n\n```\n{last_output}\n```\n</details>")
-                move_issue_to_column(fields_cache, info.get("item_id", ""), "Review")
+                # Prefix the title with [Stuck] to prevent _fix_board_orphans from
+                # auto-returning it to Ready. A human must remove the prefix to re-dispatch.
+                title = info.get("title", "")
+                if title and not title.startswith("[Stuck]"):
+                    new_title = f"[Stuck] {title}"
+                    subprocess.run(
+                        ["gh", "issue", "edit", str(issue_number),
+                         "--repo", repo, "--title", new_title],
+                        capture_output=True, text=True,
+                    )
+                # Move to Stuck if the column exists; fall back to Review otherwise.
+                target_col = "Stuck" if fields_cache["fields"]["Status"]["options"].get("Stuck") else "Review"
+                move_issue_to_column(fields_cache, info.get("item_id", ""), target_col)
                 cleanup_worktree(project_dir, issue_number, info.get("project"))
                 output_file.unlink(missing_ok=True)
                 stderr_file.unlink(missing_ok=True)
@@ -1752,19 +2172,51 @@ def phase_harvest(state, config, fields_cache, routes):
             if not merge_ok:
                 is_transient = merge_error and ("deadlock" in merge_error.lower() or "ORIG_HEAD" in merge_error)
                 label = "Transient merge failure (macOS EDEADLK)" if is_transient else "Merge conflict"
-                log.warning("%s for issue %s, moving to Review", label, cid)
+
+                # Track retry count for persistent conflicts. Transient EDEADLK
+                # failures don't count (merge_worktree already retries those).
+                # Mirrors the skeptic_rejections pattern to prevent infinite loops
+                # where _fix_board_orphans moves Review→Ready and we re-dispatch.
+                max_merge_retries = config.get("evaluation", {}).get("max_merge_retries", 3)
+                merge_retries = state.setdefault("merge_retries", {})
+                count = merge_retries.get(cid, 0)
+                if not is_transient:
+                    count += 1
+                    merge_retries[cid] = count
+
+                log.warning("%s for issue %s (attempt %d/%d), moving to Review",
+                            label, cid, count, max_merge_retries)
                 gh_issue_comment(repo, issue_number,
-                    f"**{label}** — moving to Review.\n\n"
+                    f"**{label}** (merge attempt {count}/{max_merge_retries}) — moving to Review.\n\n"
                     f"Branch `{info.get('branch', '')}` preserved for manual merging.\n\n"
                     f"Agent type: `{info['agent']}`\n"
                     f"Error: `{merge_error}`")
+
+                # At cap: prepend `[Review]` to the issue title so that
+                # _fix_board_orphans no longer auto-returns it to Ready on the
+                # next cycle. Requires human intervention to clear.
+                if count >= max_merge_retries:
+                    title = info.get("title", "")
+                    if title and not title.startswith("[Review]"):
+                        new_title = f"[Review] {title}"
+                        log.warning("Merge retry cap hit for %s — prefixing title with [Review]", cid)
+                        subprocess.run(
+                            ["gh", "issue", "edit", str(issue_number),
+                             "--repo", repo, "--title", new_title],
+                            capture_output=True, text=True,
+                        )
+
                 move_issue_to_column(fields_cache, info.get("item_id", ""), "Review")
             else:
+                # Merge succeeded — reset the retry counter. If a prior cap was
+                # hit and the title was prefixed with [Review], a human has
+                # already cleared it to get here; don't touch the title.
+                state.get("merge_retries", {}).pop(cid, None)
+
                 # --- Skeptic routing: the Skeptic decides where work goes ---
                 if info.get("column") == "Skeptic":
                     MAX_SKEPTIC_REJECTIONS = config.get("evaluation", {}).get("max_skeptic_rejections", 3)
-                    ps = state.get("pipeline_state", {}).get(cid, {})
-                    skeptic_rejections = ps.get("skeptic_rejections", 0)
+                    skeptic_rejections = state.get("skeptic_rejections", {}).get(cid, 0)
 
                     verdict = extract_verdict(output_text)
                     if verdict:
@@ -1789,7 +2241,7 @@ def phase_harvest(state, config, fields_cache, routes):
                         if decision == "APPROVE":
                             next_column = route
                             # Reset rejection counter on approval
-                            state.setdefault("pipeline_state", {}).setdefault(cid, {})["skeptic_rejections"] = 0
+                            state.setdefault("skeptic_rejections", {})[cid] = 0
                             log.info("Skeptic APPROVED %s → %s: %s", cid, route, reason)
                         else:
                             skeptic_rejections += 1
@@ -1799,7 +2251,7 @@ def phase_harvest(state, config, fields_cache, routes):
                                 log.warning("Skeptic %s hit max rejections (%d) → Review", cid, skeptic_rejections)
                             else:
                                 next_column = route
-                                state.setdefault("pipeline_state", {}).setdefault(cid, {})["skeptic_rejections"] = skeptic_rejections
+                                state.setdefault("skeptic_rejections", {})[cid] = skeptic_rejections
                                 log.info("Skeptic REJECTED %s → %s (%d/%d): %s",
                                          cid, route, skeptic_rejections, MAX_SKEPTIC_REJECTIONS, reason)
 
@@ -1807,7 +2259,10 @@ def phase_harvest(state, config, fields_cache, routes):
                             f"**Skeptic verdict: {decision}** → **{next_column}**\n\n"
                             f"**Reason:** {reason}\n\n"
                         )
-                        skeptic_created = create_followup_issues(issues_created, config, fields_cache, cid)
+                        skeptic_created = create_followup_issues(
+                            issues_created, config, fields_cache, cid,
+                            source_parent=info.get("parent_issue"),
+                        )
                         if skeptic_created:
                             urls_md = "\n".join(f"- {u}" for u in skeptic_created)
                             comment_body += f"**Issues created ({len(skeptic_created)}):**\n{urls_md}\n\n"
@@ -1830,8 +2285,9 @@ def phase_harvest(state, config, fields_cache, routes):
                         log.warning("Skeptic %s: no verdict found in output", cid)
                 else:
                     # --- Normal agents: advance through pipeline ---
-                    pipeline = info.get("pipeline")
-                    pipeline_idx = info.get("pipeline_index", 0)
+                    ps = state.get("pipeline_state", {}).get(cid, {})
+                    pipeline = ps.get("pipeline")
+                    pipeline_idx = ps.get("pipeline_index", 0)
                     if pipeline and pipeline_idx + 1 < len(pipeline):
                         next_column = pipeline[pipeline_idx + 1]
                     else:
@@ -1846,7 +2302,10 @@ def phase_harvest(state, config, fields_cache, routes):
                             f"**Commits:** {structured.get('COMMITS', 'none listed')}\n\n"
                         )
                         followup = structured.get("FOLLOWUP", "none")
-                        created_urls = create_followup_issues(followup, config, fields_cache, cid)
+                        created_urls = create_followup_issues(
+                            followup, config, fields_cache, cid,
+                            source_parent=info.get("parent_issue"),
+                        )
                         if created_urls:
                             urls_md = "\n".join(f"- {u}" for u in created_urls)
                             comment_body += f"**Follow-up issues created ({len(created_urls)}):**\n{urls_md}\n\n"
@@ -1874,9 +2333,10 @@ def phase_harvest(state, config, fields_cache, routes):
                 # Find the target column nearest to (but not before) current position
                 # to handle duplicate column names (e.g., Skeptic appears 3x in feature).
                 # If Skeptic routes to Ready, preserve pipeline state so we resume correctly.
-                pipeline = info.get("pipeline")
+                ps = state.get("pipeline_state", {}).get(cid, {})
+                pipeline = ps.get("pipeline")
                 if pipeline:
-                    current_idx = info.get("pipeline_index", 0)
+                    current_idx = ps.get("pipeline_index", 0)
                     if next_column in pipeline:
                         # Find nearest occurrence at or after current position
                         new_idx = None
@@ -1898,11 +2358,21 @@ def phase_harvest(state, config, fields_cache, routes):
                                 "pipeline_index": new_idx,
                             }
                     elif next_column == "Ready":
-                        # Skeptic sent to Ready — preserve pipeline at current position
-                        # so we resume where we left off, not restart from scratch
+                        # Skeptic sent to Ready — advance past Skeptic so next cycle
+                        # doesn't re-enter the same Skeptic position (infinite loop).
+                        # Find the next occurrence of Skeptic after current_idx to skip it.
+                        next_idx = current_idx
+                        for i in range(current_idx + 1, len(pipeline)):
+                            if pipeline[i] != "Skeptic":
+                                next_idx = i
+                                break
+                        else:
+                            # No non-Skeptic stage found ahead; stay at current to avoid
+                            # going backwards in the pipeline
+                            next_idx = current_idx
                         state.setdefault("pipeline_state", {})[cid] = {
                             "pipeline": pipeline,
-                            "pipeline_index": current_idx,
+                            "pipeline_index": next_idx,
                         }
 
                 cleanup_worktree(project_dir, issue_number, info.get("project"))
@@ -1914,9 +2384,16 @@ def phase_harvest(state, config, fields_cache, routes):
             stderr_file.unlink(missing_ok=True)
             del state["running"][cid]
             save_state(state)
-        except Exception:
-            log.exception("Error harvesting issue %s, skipping", cid)
+        except (subprocess.CalledProcessError, OSError, json.JSONDecodeError) as e:
+            # Expected runtime failures: gh/git CLI errors, filesystem issues,
+            # bad agent output. Skip this issue and continue — other harvests
+            # may still succeed this cycle.
+            log.exception("Error harvesting %s (%s) — skipping", cid, type(e).__name__)
             continue
+        # Programmer errors (KeyError from malformed state, AttributeError,
+        # TypeError, ValueError) intentionally propagate: crashing the cycle
+        # and surfacing the bug is better than silently skipping on a
+        # corrupted state["running"] entry.
 
 
 def _notify_epic_blocked(info, issue_num, blocker, repo, config):
@@ -2051,10 +2528,20 @@ def cleanup_orphans(state, config):
 
 
 def _fix_board_orphans(config, fields_cache):
-    """Fix board items with no status or stuck in Stuck — move to Ready.
+    """Fix board items with no status or lingering in Review/Stuck — move to Ready.
 
-    Also moves CLOSED items out of Ready to Done.
+    Handles:
+    - OPEN items with no Status → Ready (Epics → Backlog)
+    - OPEN items in Review without a [Review] or [Interview] title prefix → Ready
+    - OPEN items in Stuck without a [Stuck] title prefix → Ready
+    - CLOSED items not in Done → Done
+
     Runs every cycle to prevent items from falling into limbo.
+
+    Escape hatches:
+    - [Review] prefix: human placed this in Review intentionally; leave it alone
+    - [Interview] prefix: same — awaiting human input
+    - [Stuck] prefix: max retries exhausted; needs human intervention before retry
     """
     owner = config["github_repo"].split("/")[0]
     project_num = config["github_project_number"]
@@ -2062,39 +2549,31 @@ def _fix_board_orphans(config, fields_cache):
     field_id = fields_cache["fields"]["Status"]["id"]
     ready_id = fields_cache["fields"]["Status"]["options"].get("Ready")
     done_id = fields_cache["fields"]["Status"]["options"].get("Done")
+    stuck_id = fields_cache["fields"]["Status"]["options"].get("Stuck")
 
     if not ready_id or not done_id:
         return
 
-    query = f'''query {{
-        user(login: "{owner}") {{
-            projectV2(number: {project_num}) {{
-                items(first: 100) {{
-                    nodes {{
-                        id
-                        content {{
-                            ... on Issue {{ number state title }}
-                        }}
-                        fieldValues(first: 15) {{
-                            nodes {{
-                                ... on ProjectV2ItemFieldSingleSelectValue {{
-                                    name
-                                    field {{ ... on ProjectV2SingleSelectField {{ name }} }}
-                                }}
-                            }}
-                        }}
-                    }}
-                }}
-            }}
-        }}
-    }}'''
-
-    data = gh_graphql(query)
-    if not data:
+    node_fields = """\
+                            id
+                            content {
+                                ... on Issue { number state title }
+                            }
+                            fieldValues(first: 15) {
+                                nodes {
+                                    ... on ProjectV2ItemFieldSingleSelectValue {
+                                        name
+                                        field { ... on ProjectV2SingleSelectField { name } }
+                                    }
+                                }
+                            }"""
+    all_nodes = paginate_project_items(owner, project_num, node_fields)
+    if not all_nodes:
+        # paginate_project_items already logged the warning; nothing to fix.
         return
 
     fixed = 0
-    for node in data["data"]["user"]["projectV2"]["items"]["nodes"]:
+    for node in all_nodes:
         content = node.get("content")
         if not content:
             continue
@@ -2109,8 +2588,11 @@ def _fix_board_orphans(config, fields_cache):
         title = content.get("title", "")
         backlog_id = fields_cache["fields"]["Status"]["options"].get("Backlog")
 
-        if issue_state == "CLOSED" and status not in ("Done", None):
-            # Closed but not in Done — fix immediately
+        if issue_state == "CLOSED" and status != "Done":
+            # Closed but not in Done — move to Done regardless of current status
+            # (includes the no-status case: ancient closed items that predate
+            # the Status field, which would otherwise pile up in the board's
+            # "No Status" bucket forever).
             target = done_id
         elif issue_state == "OPEN" and status is None:
             # No status. Epics go to Backlog (they're containers, not dispatchable).
@@ -2120,7 +2602,14 @@ def _fix_board_orphans(config, fields_cache):
             # Only move non-interview/review items back to Ready
             if not (title.startswith("[Interview]") or title.startswith("[Review]")):
                 target = ready_id
+        elif issue_state == "OPEN" and status == "Stuck" and stuck_id:
+            # Move non-[Stuck]-prefixed items back to Ready for another attempt.
+            # Items with [Stuck] prefix were placed here intentionally (max retries
+            # exhausted) and require human intervention before re-dispatch.
+            if not title.startswith("[Stuck]"):
+                target = ready_id
         # [Interview] issues in Review stay there — they need human input
+        # [Stuck] issues with the prefix stay there — they need human intervention
 
         if target:
             mutation = f'''mutation {{
@@ -2137,6 +2626,112 @@ def _fix_board_orphans(config, fields_cache):
 
     if fixed:
         log.info("Board hygiene: fixed %d orphaned items", fixed)
+
+
+_REQUIRED_CONFIG_KEYS = (
+    "github_repo",
+    "github_project_number",
+    "projects_root",
+    "providers",
+    "default_provider",
+)
+
+# Top-level state keys that must be dicts.  running/pipeline_state/skeptic_rejections
+# are guaranteed by migrate_state; merge_retries/retry_queue are lazily created, so
+# their absence is a warning, not a fatal error.
+_STATE_DICT_KEYS_REQUIRED = ("running", "pipeline_state", "skeptic_rejections")
+_STATE_DICT_KEYS_OPTIONAL = ("merge_retries", "retry_queue")
+
+
+def phase_orphan_guard(config, fields_cache):
+    """Enforce 'every story must have a parent Epic' at data-layer level.
+
+    Runs every cycle. Scans the board for OPEN non-Epic issues with no
+    parent linkage (orphans) and either:
+      - auto-links to the repo's sole OPEN Epic (unambiguous case), or
+      - logs an ERROR naming the orphan so the user can triage.
+
+    Catches orphans regardless of creation path:
+      - user-created (GitHub UI — no bakery hook fires)
+      - agent raw `gh issue create` without addSubIssue
+      - bakery's own create_followup_issues when source_parent is missing
+        or the addSubIssue mutation failed
+
+    Orphans will NOT dispatch under the Epic-gate in poll_board. Without
+    this guard, they'd sit silently on the board.
+    """
+    owner = config["github_repo"].split("/")[0]
+    project_num = config["github_project_number"]
+
+    node_fields = """
+                            content {
+                                ... on Issue {
+                                    number
+                                    title
+                                    state
+                                    repository { name nameWithOwner }
+                                    subIssues(first: 1) { totalCount }
+                                    parent { number }
+                                }
+                            }"""
+    all_nodes = paginate_project_items(owner, project_num, node_fields)
+
+    # Build per-repo list of OPEN Epics (anything with sub-issues).
+    open_epics_by_repo = {}  # repo_full → [issue_number, ...]
+    orphans = []             # list of {"repo": owner/name, "number": N, "title": str}
+    for node in all_nodes:
+        c = node.get("content") or {}
+        if not c or c.get("state") != "OPEN":
+            continue
+        repo_full = (c.get("repository") or {}).get("nameWithOwner")
+        num = c.get("number")
+        if not repo_full or num is None:
+            continue
+        is_epic = ((c.get("subIssues") or {}).get("totalCount") or 0) > 0
+        if is_epic:
+            open_epics_by_repo.setdefault(repo_full, []).append(num)
+            continue
+        if c.get("parent"):
+            continue
+        orphans.append({"repo": repo_full, "number": num, "title": c.get("title", "")})
+
+    if not orphans:
+        return
+
+    linked = 0
+    ambiguous = []
+    no_epic = []
+    for orphan in orphans:
+        repo = orphan["repo"]
+        epics = open_epics_by_repo.get(repo, [])
+        if len(epics) == 1:
+            # Unambiguous — auto-link.
+            parent_num = epics[0]
+            issue_url = f"https://github.com/{repo}/issues/{orphan['number']}"
+            if link_as_sub_issue(repo, parent_num, issue_url):
+                log.info("orphan-guard: auto-linked %s#%d → Epic #%d (sole open Epic in %s)",
+                         repo, orphan["number"], parent_num, repo)
+                linked += 1
+            else:
+                log.warning("orphan-guard: failed to link %s#%d to Epic #%d",
+                            repo, orphan["number"], parent_num)
+        elif len(epics) == 0:
+            no_epic.append(f"{repo}#{orphan['number']} \"{orphan['title'][:50]}\"")
+        else:
+            ambiguous.append(f"{repo}#{orphan['number']} \"{orphan['title'][:50]}\"")
+
+    if linked:
+        log.info("orphan-guard: auto-linked %d orphan(s) to sole Epic in repo", linked)
+    if ambiguous:
+        log.warning(
+            "orphan-guard: %d orphan(s) need manual Epic linking — multiple Epics in repo: %s",
+            len(ambiguous), " | ".join(ambiguous[:10]),
+        )
+    if no_epic:
+        log.error(
+            "orphan-guard: %d orphan(s) in repos with NO open Epic — create an Epic first: %s",
+            len(no_epic), " | ".join(no_epic[:10]),
+        )
 
 
 def validate_environment():
@@ -2156,6 +2751,10 @@ def validate_environment():
             path = Path(config.get(key, ""))
             if not path.exists():
                 errors.append(f"{key} does not exist: {path}")
+        # Schema check: required top-level keys
+        for key in _REQUIRED_CONFIG_KEYS:
+            if key not in config:
+                errors.append(f"dispatcher.json missing required key: '{key}'")
     except (json.JSONDecodeError, KeyError) as e:
         errors.append(f"Invalid dispatcher.json: {e}")
 
@@ -2166,6 +2765,68 @@ def validate_environment():
         for err in errors:
             log.error("Startup validation failed: %s", err)
         sys.exit(1)
+
+
+def validate_state(state):
+    """Validate state.json shape after migration.
+
+    Required top-level keys must be dicts; optional keys warn if missing/wrong type.
+    Malformed pipeline_state entries (missing pipeline list or pipeline_index int)
+    are pruned so the rest of the cycle doesn't trip over them.
+
+    This is a read-and-prune pass only — no new writes beyond what migrate_state did.
+    """
+    for key in _STATE_DICT_KEYS_REQUIRED:
+        if key not in state:
+            log.error("State validation: required key '%s' missing after migration — resetting", key)
+            state[key] = {}
+        elif not isinstance(state[key], dict):
+            log.error(
+                "State validation: '%s' is %s, expected dict — resetting",
+                key, type(state[key]).__name__,
+            )
+            state[key] = {}
+
+    for key in _STATE_DICT_KEYS_OPTIONAL:
+        if key not in state:
+            log.debug("State validation: optional key '%s' absent (will be created on demand)", key)
+        elif not isinstance(state[key], dict):
+            log.error(
+                "State validation: '%s' is %s, expected dict — resetting",
+                key, type(state[key]).__name__,
+            )
+            state[key] = {}
+
+    ps = state.get("pipeline_state", {})
+    pruned = 0
+    for cid in list(ps.keys()):
+        entry = ps[cid]
+        if not isinstance(entry, dict):
+            log.error(
+                "State validation: pipeline_state[%s] is %s, not a dict — pruning",
+                cid, type(entry).__name__,
+            )
+            del ps[cid]
+            pruned += 1
+            continue
+        if not isinstance(entry.get("pipeline"), list):
+            log.error(
+                "State validation: pipeline_state[%s] missing 'pipeline' list — pruning", cid,
+            )
+            del ps[cid]
+            pruned += 1
+            continue
+        if not isinstance(entry.get("pipeline_index"), int):
+            log.error(
+                "State validation: pipeline_state[%s] missing 'pipeline_index' int — pruning", cid,
+            )
+            del ps[cid]
+            pruned += 1
+
+    if pruned:
+        log.warning("State validation pruned %d malformed pipeline_state entry/entries", pruned)
+
+    return state
 
 
 def main():
@@ -2191,6 +2852,8 @@ def main():
         config = load_config()
         routes = load_routes()
         state = load_state()
+        state = migrate_state(state)
+        state = validate_state(state)
 
         cleanup_orphans(state, config)
 
@@ -2213,11 +2876,27 @@ def main():
         phase_harvest(state, config, fields_cache, routes)
         save_state(state)
 
+        # Construct a shared budget tracker for phases 4 and 7.
+        # Both phases call budget.reserve() before spawning and budget.release()
+        # on failure, so the count stays in sync with state["running"] without
+        # either phase re-reading the dict independently.
+        _budget_cfg = get_budget_profile(config)
+        dispatch_budget = BudgetTracker(
+            max_concurrent=_budget_cfg["max_concurrent"],
+            running_count=len(state["running"]),
+        )
+
         # Phase 4: Process retry queue (re-dispatch failed evaluations)
-        phase_retry_queue(state, config, fields_cache, routes)
+        phase_retry_queue(state, config, fields_cache, routes, dispatch_budget)
         save_state(state)
 
-        # Phase 5: Board hygiene — fix orphaned items (None/Stuck → Ready)
+        # Phase 4.5: Orphan guard — enforce "every story has a parent Epic"
+        # across the whole board. Runs before board-hygiene and poll so any
+        # auto-linkage this cycle is visible to downstream phases.
+        if not DRY_RUN:
+            phase_orphan_guard(config, fields_cache)
+
+        # Phase 5: Board hygiene — fix orphaned items (None/Review → Ready, Closed → Done)
         if not DRY_RUN:
             _fix_board_orphans(config, fields_cache)
 
@@ -2226,7 +2905,7 @@ def main():
         save_state(state)
 
         # Phase 7: Poll and dispatch
-        phase_poll_and_dispatch(state, config, fields_cache, routes)
+        phase_poll_and_dispatch(state, config, fields_cache, routes, dispatch_budget)
         state["last_poll"] = datetime.now(timezone.utc).isoformat()
         save_state(state)
 
@@ -2236,7 +2915,7 @@ def main():
         except Exception:
             log.debug("Failed to save usage snapshot (non-critical)")
 
-        budget_summary = get_budget_summary(state)
+        budget_summary = get_budget_summary(state, config)
         log.info("Dispatcher cycle complete. Running: %d agents. %s",
                  len(state["running"]), budget_summary)
     except Exception:
