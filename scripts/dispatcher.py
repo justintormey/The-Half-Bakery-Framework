@@ -425,6 +425,19 @@ def create_followup_issues(followup_text, config, fields_cache, source_cid,
             if _gh_issue_url_re.fullmatch(line):
                 log.info("Skipping creation — entry is an existing issue URL: %s", line)
                 created.append(line)
+                # Still link to the Epic — the agent may have created this issue
+                # via `gh issue create` without going through addSubIssue
+                # (half-bakery#219).  Linkage failure is non-fatal.
+                if source_parent and not DRY_RUN:
+                    p_repo = source_parent.get("repo", "")
+                    p_num = source_parent.get("number")
+                    if p_repo and p_num:
+                        if not link_as_sub_issue(p_repo, p_num, line):
+                            log.warning(
+                                "Could not link pre-existing %s as sub-issue of Epic #%d in %s "
+                                "(stale parent or permission issue) — linkage skipped",
+                                line, p_num, p_repo,
+                            )
                 continue
 
             segments = [s.strip() for s in line.split("|")]
