@@ -3,8 +3,9 @@
   "agent_timeout_minutes": 45,
   "projects_root": "~/PROJECTS",
   "agents_root": "~/PROJECTS/half-bakery/agents",
-  "github_repo": "youruser/half-bakery",
+  "github_repo": "justintormey/half-bakery",
   "github_project_number": 1,
+  "polish_epic_number": 124,
   "state_dir": "~/.half-bakery",
   "claude_permission_mode": "bypassPermissions",
   "spanning_projects": ["half-bakery"],
@@ -15,21 +16,18 @@
     },
     "local": {
       "type": "local",
-      "base_url": "http://YOUR_LOCAL_LLM_IP:8080/v1",
+      "base_url": "http://192.168.0.206:8080/v1",
       "model": "qwen3-coder",
-      "ctx_size": 65536,
+      "ctx_size": 131072,
       "max_turns": 50,
       "fallback_provider": "claude"
     }
   },
   "agent_models": {
     "founding-engineer": "sonnet",
-    "architect": "sonnet",
-    "research-analyst": "sonnet",
-    "skeptic": "sonnet",
-    "qa": "sonnet",
+    "designer": "sonnet",
     "documentarian": "sonnet",
-    "designer": "sonnet"
+    "review": "sonnet"
   },
   "budget": {
     "work_hours": {"start": 9, "end": 18},
@@ -42,6 +40,8 @@
   },
   "evaluation": {
     "max_retries": 2,
+    "max_skeptic_rejections": 3,
+    "max_merge_retries": 3,
     "run_tests": true,
     "llm_spot_check": false
   },
@@ -58,5 +58,6 @@
   },
   "test_commands": {
     "default": null
-  }
+  },
+  "project_overrides": {}
 }

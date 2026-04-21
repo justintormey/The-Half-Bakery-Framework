@@ -6,6 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
+## [2.2.0] — 2026-04-20
+
+### Summary
+
+Major pipeline simplification: Research, Architecture, QA, and Skeptic agents removed. Single Review agent replaces QA + Skeptic. Three pipelines replace eight.
+
+---
+
+### 🔄 Breaking Changes
+
+#### Pipeline refactoring: 8 pipelines → 3, 7 agents → 4
+The Research, Architecture, QA, and Skeptic columns and agents have been removed. All work now flows through one of three pipelines:
+- `engineering`: Engineering → Review → Done
+- `design`: Design → Review → Done
+- `docs`: Docs → Review → Done
+
+The new `Review` agent combines QA code review (correctness, security, semver) with Skeptic claim verification (diff audit, hallucination checks, data lifecycle audit, Epic linkage enforcement). Output uses the same `##VERDICT##` block format.
+
+The `column-routes.json` pipeline templates are now keyed `engineering`, `design`, `docs` (replacing `bug`, `feature`, `research`, `architecture`, `chore`, `docs`, `design`, `polish`).
+
+#### Issue classifier keywords tightened
+Generic words (`add`, `update`, `new`) removed from the engineering bucket so `design` and `docs` keywords win when present.
+
+---
+
+### 🐛 Bug Fixes
+
+#### Dispatcher: Review column no longer routes to itself on rejection cap
+Max-rejection escalation now routes to `Stuck` instead of a human `Review` column (which conflicted with the new agent Review column).
+
+#### FOLLOWUP issue cascade prevention
+- Hard cap of 5 followup issues per agent completion (configurable via `max_followup_issues`)
+- Title validation rejects entries under 15 chars or starting lowercase (catches research prose bleed-through)
+- Sub-issue linkage now fires **before** `project item-add` to prevent GitHub's auto-enroll creating duplicate "Group selected" board entries
+
+#### Epic-gate: parent not on board no longer blocks dispatch
+`_ancestors_all_ready` now returns True when a parent exists in GitHub's issue hierarchy but is not on the project board, treating "Epic not board-managed" as "no gate active."
+
+---
+
 ## [2.1.1] — 2026-04-20
 
 ### Summary

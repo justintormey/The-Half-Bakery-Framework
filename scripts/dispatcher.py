@@ -410,10 +410,19 @@ def create_followup_issues(followup_text, config, fields_cache, source_cid,
         r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/\d+'
     )
 
+    max_followups = config.get("max_followup_issues", 5)
     created = []
     for raw_line in followup_text.splitlines():
+        if len(created) >= max_followups:
+            log.warning(
+                "create_followup_issues: hit cap of %d issues for %s — remaining FOLLOWUP lines ignored",
+                max_followups, source_cid,
+            )
+            break
         # ISSUES_CREATED may be comma-separated on one line; split those too.
         for raw_item in raw_line.split(","):
+            if len(created) >= max_followups:
+                break
             line = raw_item.strip().strip("-").strip()
             if not line or line.lower() == "none":
                 continue
@@ -456,6 +465,17 @@ def create_followup_issues(followup_text, config, fields_cache, source_cid,
                 continue
 
             if not title:
+                continue
+
+            # Reject fragment titles — signs an agent dumped research prose into FOLLOWUP.
+            # A valid issue title: ≥15 chars, starts with a capital letter or digit,
+            # and doesn't begin with a lowercase continuation word.
+            title_stripped = title.strip()
+            if len(title_stripped) < 15:
+                log.warning("Skipping FOLLOWUP with too-short title (%d chars): %r", len(title_stripped), title_stripped)
+                continue
+            if title_stripped[0].islower():
+                log.warning("Skipping FOLLOWUP with lowercase-start title (likely a fragment): %r", title_stripped[:60])
                 continue
 
             body_full = f"{body}\n\n_Auto-created from agent output on {source_cid}_"
@@ -958,9 +978,9 @@ def auto_route(item, routes):
     """Use Claude to classify which pipeline column an issue belongs to."""
     columns = list(routes.get("columns", {}).keys())
     descriptions = {
-        "Engineering": "Build features, fix bugs, write code, implement changes",
-        "Research": "Investigate questions, evaluate options, produce analysis",
-        "Architecture": "Design systems, write RFCs, plan technical approaches",
+        "Engineering": "Build features, fix bugs, write code, implement changes, research, planning",
+        "Design":      "UI/UX design, visual polish, wireframes, mockups",
+        "Docs":        "Write or update documentation, README, changelog",
     }
     column_list = "\n".join(
         f"- {col}: {descriptions.get(col, routes['columns'][col].get('agent', ''))}"
@@ -2226,10 +2246,10 @@ def phase_harvest(state, config, fields_cache, routes):
                 # already cleared it to get here; don't touch the title.
                 state.get("merge_retries", {}).pop(cid, None)
 
-                # --- Skeptic routing: the Skeptic decides where work goes ---
-                if info.get("column") == "Skeptic":
-                    MAX_SKEPTIC_REJECTIONS = config.get("evaluation", {}).get("max_skeptic_rejections", 3)
-                    skeptic_rejections = state.get("skeptic_rejections", {}).get(cid, 0)
+                # --- Review routing: Review agent decides where work goes ---
+                if info.get("column") == "Review":
+                    MAX_REVIEW_REJECTIONS = config.get("evaluation", {}).get("max_skeptic_rejections", 3)
+                    review_rejections = state.get("skeptic_rejections", {}).get(cid, 0)
 
                     verdict = extract_verdict(output_text)
                     if verdict:
@@ -2239,46 +2259,46 @@ def phase_harvest(state, config, fields_cache, routes):
                         issues_created = verdict.get("ISSUES_CREATED", "none")
 
                         # Validate route is a real column
-                        valid_columns = set(routes["columns"].keys()) | {"Ready", "Done", "Review"}
+                        valid_columns = set(routes["columns"].keys()) | {"Done"}
                         if route not in valid_columns:
-                            route = "Review"
-                            log.warning("Skeptic gave invalid route '%s', falling back to Review",
+                            route = "Stuck"
+                            log.warning("Review gave invalid route '%s', falling back to Stuck",
                                         verdict.get("ROUTE", ""))
 
-                        # Guard: Skeptic must not route to itself (infinite loop)
-                        if route == "Skeptic":
-                            log.warning("Skeptic %s routed to itself — redirecting to Review", cid)
-                            route = "Review"
+                        # Guard: Review must not route to itself (infinite loop)
+                        if route == "Review":
+                            log.warning("Review %s routed to itself — redirecting to Stuck", cid)
+                            route = "Stuck"
                             decision = "REJECT"
 
                         if decision == "APPROVE":
                             next_column = route
                             # Reset rejection counter on approval
                             state.setdefault("skeptic_rejections", {})[cid] = 0
-                            log.info("Skeptic APPROVED %s → %s: %s", cid, route, reason)
+                            log.info("Review APPROVED %s → %s: %s", cid, route, reason)
                         else:
-                            skeptic_rejections += 1
-                            if skeptic_rejections >= MAX_SKEPTIC_REJECTIONS:
-                                next_column = "Review"
-                                reason += f" [Skeptic rejection cap reached ({skeptic_rejections}/{MAX_SKEPTIC_REJECTIONS}) — escalating to Review]"
-                                log.warning("Skeptic %s hit max rejections (%d) → Review", cid, skeptic_rejections)
+                            review_rejections += 1
+                            if review_rejections >= MAX_REVIEW_REJECTIONS:
+                                next_column = "Stuck"
+                                reason += f" [Review rejection cap reached ({review_rejections}/{MAX_REVIEW_REJECTIONS}) — escalating to Stuck]"
+                                log.warning("Review %s hit max rejections (%d) → Stuck", cid, review_rejections)
                             else:
                                 next_column = route
-                                state.setdefault("skeptic_rejections", {})[cid] = skeptic_rejections
-                                log.info("Skeptic REJECTED %s → %s (%d/%d): %s",
-                                         cid, route, skeptic_rejections, MAX_SKEPTIC_REJECTIONS, reason)
+                                state.setdefault("skeptic_rejections", {})[cid] = review_rejections
+                                log.info("Review REJECTED %s → %s (%d/%d): %s",
+                                         cid, route, review_rejections, MAX_REVIEW_REJECTIONS, reason)
 
                         comment_body = (
-                            f"**Skeptic verdict: {decision}** → **{next_column}**\n\n"
+                            f"**Review verdict: {decision}** → **{next_column}**\n\n"
                             f"**Reason:** {reason}\n\n"
                         )
-                        skeptic_created = create_followup_issues(
+                        review_created = create_followup_issues(
                             issues_created, config, fields_cache, cid,
                             source_parent=info.get("parent_issue"),
                         )
-                        if skeptic_created:
-                            urls_md = "\n".join(f"- {u}" for u in skeptic_created)
-                            comment_body += f"**Issues created ({len(skeptic_created)}):**\n{urls_md}\n\n"
+                        if review_created:
+                            urls_md = "\n".join(f"- {u}" for u in review_created)
+                            comment_body += f"**Issues created ({len(review_created)}):**\n{urls_md}\n\n"
                         elif issues_created and issues_created.lower() != "none":
                             comment_body += f"**Issues noted:** {issues_created}\n\n"
 
@@ -2289,13 +2309,13 @@ def phase_harvest(state, config, fields_cache, routes):
                             f"```\n{raw}\n```\n</details>"
                         )
                     else:
-                        # Skeptic didn't produce a verdict — treat as rejection to Review
-                        next_column = "Review"
+                        # Review didn't produce a verdict — escalate to Stuck for human inspection
+                        next_column = "Stuck"
                         comment_body = (
-                            f"**Skeptic** completed but produced no verdict. "
-                            f"Moving to **Review** for human inspection.\n\n"
+                            f"**Review** completed but produced no verdict. "
+                            f"Moving to **Stuck** for human inspection.\n\n"
                         )
-                        log.warning("Skeptic %s: no verdict found in output", cid)
+                        log.warning("Review %s: no verdict found in output", cid)
                 else:
                     # --- Normal agents: advance through pipeline ---
                     ps = state.get("pipeline_state", {}).get(cid, {})
@@ -2371,17 +2391,14 @@ def phase_harvest(state, config, fields_cache, routes):
                                 "pipeline_index": new_idx,
                             }
                     elif next_column == "Ready":
-                        # Skeptic sent to Ready — advance past Skeptic so next cycle
-                        # doesn't re-enter the same Skeptic position (infinite loop).
-                        # Find the next occurrence of Skeptic after current_idx to skip it.
+                        # Review sent to Ready — advance past Review so next cycle
+                        # doesn't re-enter the same Review position (infinite loop).
                         next_idx = current_idx
                         for i in range(current_idx + 1, len(pipeline)):
-                            if pipeline[i] != "Skeptic":
+                            if pipeline[i] != "Review":
                                 next_idx = i
                                 break
                         else:
-                            # No non-Skeptic stage found ahead; stay at current to avoid
-                            # going backwards in the pipeline
                             next_idx = current_idx
                         state.setdefault("pipeline_state", {})[cid] = {
                             "pipeline": pipeline,

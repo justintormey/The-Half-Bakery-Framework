@@ -167,12 +167,10 @@ def gate_llm_spot_check(issue_title, issue_body, diff_text, claude_bin):
 
 # Which gates apply to which columns
 COLUMN_GATES = {
-    "Engineering":  ["output_exists", "summary_block", "git_diff", "scope_match", "test_suite"],
-    "Research":     ["output_exists", "summary_block"],
-    "Architecture": ["output_exists", "summary_block"],
-    "Skeptic":      ["output_exists"],  # Skeptic has its own verdict format
-    "QA":           ["output_exists", "summary_block"],
-    "Docs":         ["output_exists", "summary_block"],
+    "Engineering": ["output_exists", "summary_block", "git_diff", "scope_match", "test_suite"],
+    "Design":      ["output_exists", "summary_block"],
+    "Docs":        ["output_exists", "summary_block"],
+    "Review":      ["output_exists"],  # Review has its own ##VERDICT## format
 }
 
 
@@ -300,23 +298,19 @@ def extract_verdict(output_text):
 # ---------------------------------------------------------------------------
 
 PIPELINE_TEMPLATES = {
-    "bug":          ["Engineering", "QA", "Skeptic", "Done"],
-    "feature":      ["Research", "Architecture", "Engineering", "QA", "Docs", "Skeptic", "Done"],
-    "research":     ["Research", "Skeptic", "Done"],
-    "architecture": ["Architecture", "Skeptic", "Done"],
-    "chore":        ["Engineering", "Skeptic", "Done"],
-    "docs":         ["Docs", "Skeptic", "Done"],
-    "polish":       ["Engineering", "QA", "Skeptic", "Done"],
+    "engineering": ["Engineering", "Review", "Done"],
+    "design":      ["Design", "Review", "Done"],
+    "docs":        ["Docs", "Review", "Done"],
 }
 
 CLASSIFY_KEYWORDS = {
-    "bug":          ["bug", "fix", "error", "broken", "crash", "regression", "issue"],
-    "feature":      ["feature", "add", "implement", "build", "create", "new", "support"],
-    "research":     ["research", "investigate", "explore", "analyze", "evaluate", "survey"],
-    "architecture": ["design", "architecture", "rfc", "system design", "plan", "proposal"],
-    "chore":        ["chore", "cleanup", "refactor", "update deps", "maintenance", "ci/cd", "todo", "fixme", "hack", "address"],
-    "docs":         ["document", "readme", "changelog", "docs", "documentation"],
-    "polish":       ["polish", "quality", "improvements", "professionalism"],
+    "docs":        ["document", "readme", "changelog", "docs", "documentation"],
+    "design":      ["design", "ui", "ux", "visual", "layout", "style", "wireframe", "mockup", "figma", "prototype"],
+    "engineering": [
+        "bug", "fix", "error", "broken", "crash", "regression",
+        "implement", "build", "refactor", "cleanup", "maintenance",
+        "research", "investigate", "analyze", "architecture",
+    ],
 }
 
 
@@ -334,5 +328,5 @@ def classify_issue(title, body):
         best = max(scores, key=scores.get)
         return best, PIPELINE_TEMPLATES[best]
 
-    # Default to feature pipeline
-    return "feature", PIPELINE_TEMPLATES["feature"]
+    # Default to engineering pipeline
+    return "engineering", PIPELINE_TEMPLATES["engineering"]

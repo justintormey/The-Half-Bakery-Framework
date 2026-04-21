@@ -1,23 +1,15 @@
 {
   "columns": {
-    "Research":     { "agent": "research-analyst",  "next": "Skeptic" },
-    "Architecture": { "agent": "architect",         "next": "Skeptic" },
-    "Engineering":  { "agent": "founding-engineer",  "next": "QA" },
-    "Design":       { "agent": "designer",          "next": "Skeptic" },
-    "Skeptic":      { "agent": "skeptic",           "next": "Ready" },
-    "QA":           { "agent": "qa",                "next": "Docs" },
-    "Docs":         { "agent": "documentarian",     "next": "Skeptic", "provider": "local" }
+    "Engineering": { "agent": "founding-engineer", "next": "Review" },
+    "Design":      { "agent": "designer",          "next": "Review" },
+    "Docs":        { "agent": "documentarian",     "next": "Review", "provider": "local" },
+    "Review":      { "agent": "review",            "next": "Done" }
   },
   "pipeline_templates": {
-    "bug":          ["Engineering", "QA", "Skeptic", "Done"],
-    "feature":      ["Research", "Skeptic", "Architecture", "Skeptic", "Engineering", "QA", "Docs", "Skeptic", "Done"],
-    "research":     ["Research", "Skeptic", "Done"],
-    "architecture": ["Architecture", "Skeptic", "Done"],
-    "chore":        ["Engineering", "Skeptic", "Done"],
-    "docs":         ["Docs", "Skeptic", "Done"],
-    "design":       ["Design", "Skeptic", "Done"],
-    "polish":       ["Design", "Engineering", "QA", "Skeptic", "Done"]
+    "engineering": ["Engineering", "Review", "Done"],
+    "design":      ["Design", "Review", "Done"],
+    "docs":        ["Docs", "Review", "Done"]
   },
   "default_route": "Engineering",
-  "non_dispatchable": ["Review", "Done", "Backlog", "Stuck"]
+  "non_dispatchable": ["Done", "Backlog", "Stuck"]
 }
