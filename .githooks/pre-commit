@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Pre-commit hook: Block PII patterns in staged files
+#
+# This hook prevents accidental commits that contain private infrastructure
+# values specific to your deployment (LAN IPs, S3 bucket paths, API keys, etc.).
+#
+# SETUP:
+#   1. Edit the PATTERNS section below to add your private values.
+#   2. Run: bash scripts/install-hooks.sh
+#
+# To bypass for an intentional update: git commit --no-verify
+
+set -euo pipefail
+
+# ── Patterns ──────────────────────────────────────────────────────────────────
+# Replace these placeholders with your actual private values.
+# Add more patterns (pipe-separated) as needed.
+#
+# Example real values this was designed for:
+#   PRIVATE_IP_PATTERN='192\.168\.0\.206'
+#   S3_PATH_PATTERN='yourname\.com/'
+PRIVATE_IP_PATTERN='YOUR_LAN_IP'
+S3_PATH_PATTERN='YOUR_S3_BUCKET/'
+
+COMBINED_PATTERN="${PRIVATE_IP_PATTERN}|${S3_PATH_PATTERN}"
+
+# ── Files where these values are expected (intentionally contain private data) ─
+# List config files that legitimately hold the private values (e.g. real infra
+# config that you have decided to keep in the repo but not sync publicly).
+ALLOWED_FILES=(
+    "config/dispatcher.json"       # real infrastructure config
+    "config/deploy-targets.json"   # real deployment targets
+    ".githooks/pre-commit"         # this file — defines the patterns being checked
+)
+
+# ── Check staged files ────────────────────────────────────────────────────────
+found_pii=0
+violations=()
+
+while IFS= read -r staged_file; do
+    [[ -z "$staged_file" ]] && continue
+
+    # Skip if this file is in the allowed list
+    allowed=0
+    for allowed_file in "${ALLOWED_FILES[@]}"; do
+        if [[ "$staged_file" == "$allowed_file" ]]; then
+            allowed=1
+            break
+        fi
+    done
+    [[ "$allowed" -eq 1 ]] && continue
+
+    # Check full staged content (not just diff) for PII patterns
+    # git show ":path" reads the index (staged) version of the file
+    if git show ":${staged_file}" 2>/dev/null | grep -Eq "$COMBINED_PATTERN"; then
+        # Find which lines triggered the match for a useful error message
+        matching_lines=$(git show ":${staged_file}" 2>/dev/null \
+            | grep -En "$COMBINED_PATTERN" \
+            | head -5 \
+            | sed 's/^/    /')
+        violations+=("  ${staged_file}:")
+        violations+=("$matching_lines")
+        found_pii=1
+    fi
+done < <(git diff --cached --name-only --diff-filter=ACM 2>/dev/null)
+
+# ── Report and block ──────────────────────────────────────────────────────────
+if [[ "$found_pii" -eq 1 ]]; then
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║  PRE-COMMIT HOOK: PII DETECTED — commit blocked             ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "The following staged files contain private infrastructure values:"
+    echo ""
+    for line in "${violations[@]}"; do
+        echo "$line"
+    done
+    echo ""
+    echo "Blocked patterns:"
+    echo "  • LAN IP:   ${PRIVATE_IP_PATTERN}"
+    echo "  • S3 paths: ${S3_PATH_PATTERN}"
+    echo ""
+    echo "Allowed files (intentionally contain these values):"
+    for f in "${ALLOWED_FILES[@]}"; do
+        echo "  • $f"
+    done
+    echo ""
+    echo "To fix: remove the private value and use a placeholder."
+    echo "To bypass intentionally: git commit --no-verify"
+    echo ""
+    exit 1
+fi
+
+exit 0

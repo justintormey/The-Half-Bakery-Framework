@@ -61,6 +61,37 @@ When in doubt, split.
 
 ---
 
+## Git Hooks Setup
+
+After cloning (or when setting up a new environment), install the tracked pre-commit hook:
+
+```bash
+bash scripts/install-hooks.sh
+```
+
+This installs `.githooks/pre-commit` into `.git/hooks/pre-commit`. The hook blocks accidental
+commits that contain private infrastructure values (LAN IPs, S3 bucket paths, etc.).
+
+**Before installing**, edit `.githooks/pre-commit` and replace the placeholder patterns with
+your actual private values:
+
+```bash
+# In .githooks/pre-commit — replace these with your real values:
+PRIVATE_IP_PATTERN='YOUR_LAN_IP'       # e.g. '192\.168\.0\.100'
+S3_PATH_PATTERN='YOUR_S3_BUCKET/'      # e.g. 'myname\.com/'
+```
+
+`config/dispatcher.json` and `config/deploy-targets.json` are excluded from the check because
+they may intentionally hold real infrastructure values. All other staged files are scanned.
+
+**Note:** The dispatcher automatically creates worktrees under `~/.half-bakery/worktrees/`.
+These worktrees share the main repo's `.git/hooks/` directory, so installing the hook once
+in the main repo protects all worktrees.
+
+To bypass for an intentional update: `git commit --no-verify`
+
+---
+
 ## Skeptic's Data Lifecycle Audit
 
 Any PR that modifies a **persisted data shape** — `state.json`, cached JSON, GitHub project fields/labels, config files, or any dict that survives across runs — **must pass the Skeptic's Data Lifecycle Audit before merge**.
