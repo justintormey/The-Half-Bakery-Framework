@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
+## [2.1.1] — 2026-04-20
+
+### Summary
+
+Patch release: discoverer pagination fix and Skeptic AGENTS.md hardening.
+
+---
+
+### 🐛 Bug Fixes
+
+#### discoverer: paginate board queries to handle >100 items
+`_scan_vision_gaps` and `_move_issue_to_ready_or_column` now paginate through all project board items using GraphQL `pageInfo`. Previously, boards with >100 items were silently truncated, causing duplicate issue creation and missed Ready-queue items.
+
+#### discoverer: `vision_max_issues_per_scan` config now honored
+`_scan_vision_gaps` accepts a `max_issues` parameter (default 15) driven by `vision_max_issues_per_scan` in config. The old hardcoded value of 7 silently ignored the config field.
+
+#### discoverer: module and phase docstrings corrected
+Module docstring no longer falsely claims "All discovery is deterministic (zero LLM tokens)" — vision-gap scanning does use Claude Sonnet. `phase_discover` docstring now reflects actual gate behavior (caller decides whether to invoke based on queue depth and agent count).
+
+---
+
+### 🔒 Skeptic Rules Hardened
+
+#### Every Story Has a Parent (Epic Linkage Rule)
+Skeptic now **REJECT**s any PR that creates or spawns issues without linking them to a parent Epic. Orphan issues sit inert in the dispatcher's Epic-gate. The review step now includes explicit GraphQL sub-issue linkage verification.
+
+#### Data Lifecycle Audit
+Skeptic now **REJECT**s PRs that touch persisted data shapes (state files, project fields, config) without auditing: all other writers, live data compatibility, and migration safety. Precedent: a 2026-04-17 incident blocked the entire fleet for hours due to unaudited schema tightening.
+
+---
+
 ## [2.1.0] — 2026-04-20
 
 ### Summary

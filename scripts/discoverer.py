@@ -2,7 +2,10 @@
 
 Scans repos for actionable improvements when the queue is empty.
 Creates GitHub issues and adds them to the project board.
-All discovery is deterministic (zero LLM tokens).
+
+Most scans are deterministic (TODO tags, deps, security — zero LLM tokens).
+Vision-gap scanning (scan_vision) calls Claude Sonnet to compare
+project-visions.md against existing open issues.
 """
 
 import json
@@ -23,12 +26,11 @@ _LINE_RE = re.compile(rf'(.+?):(\d+):.*?({_TAGS_RE})[:\s]*(.+)')
 
 
 def phase_discover(state, config, fields_cache, dry_run=False):
-    """Find work when Ready queue is empty. Creates issues in Backlog.
+    """Find work proactively. Creates issues in Backlog/Ready.
 
-    Only runs when:
-    1. No items in Ready column
-    2. Running agents < max_concurrent
-    3. Discovery is enabled in config
+    Only runs when discovery is enabled in config (discovery.enabled).
+    Caller is responsible for any gate on Ready queue depth or running
+    agent count before invoking this phase.
     """
     discovery_cfg = config.get("discovery", {})
     if not discovery_cfg.get("enabled", False):
@@ -157,7 +159,7 @@ def phase_discover(state, config, fields_cache, dry_run=False):
         vision_max = discovery_cfg.get("vision_max_issues_per_scan", 15)
         vision_created = 0
         if not _in_cooldown(discoveries, vision_key, vision_cooldown, now):
-            vision_issues = _scan_vision_gaps(config, owner, project_number)
+            vision_issues = _scan_vision_gaps(config, owner, project_number, vision_max)
             for vi in vision_issues:
                 if vision_created >= vision_max:
                     break
@@ -506,7 +508,7 @@ def _create_issue(owner, repo_name, title, body, labels, project_number):
         return None
 
 
-def _scan_vision_gaps(config, owner, project_number):
+def _scan_vision_gaps(config, owner, project_number, max_issues=15):
     """Compare project-visions.md against existing open issues across ALL repos.
 
     Uses a cheap Claude Sonnet call to:
@@ -515,6 +517,10 @@ def _scan_vision_gaps(config, owner, project_number):
 
     Returns a list of {repo, title, body, status} dicts.
     status is "Ready" for actionable issues, "Review" for interview questions.
+
+    max_issues controls the cap on returned items (driven by vision_max_issues_per_scan
+    in config; defaults to 15). Previously this was a hardcoded 7 which silently
+    ignored the config value.
     """
     import shutil
 
@@ -524,34 +530,48 @@ def _scan_vision_gaps(config, owner, project_number):
 
     vision_text = vision_path.read_text()
 
-    # Get ALL open issue titles across all repos on the board to avoid duplicates
+    # Get ALL open issue titles across all repos on the board to avoid duplicates.
+    # Paginate so boards with >100 items are fully scanned.
     existing = set()
-    try:
+    cursor = None
+    while True:
+        after = f', after: "{cursor}"' if cursor else ""
         board_query = f'''query {{
             user(login: "{owner}") {{
                 projectV2(number: {project_number}) {{
-                    items(first: 100) {{
+                    items(first: 100{after}) {{
                         nodes {{
                             content {{
                                 ... on Issue {{ title state }}
                             }}
                         }}
+                        pageInfo {{ hasNextPage endCursor }}
                     }}
                 }}
             }}
         }}'''
-        result = subprocess.run(
-            ["gh", "api", "graphql", "-f", f"query={board_query}"],
-            capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode == 0:
+        try:
+            result = subprocess.run(
+                ["gh", "api", "graphql", "-f", f"query={board_query}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                break
             data = json.loads(result.stdout)
-            for node in data.get("data", {}).get("user", {}).get("projectV2", {}).get("items", {}).get("nodes", []):
-                content = node.get("content")
-                if content and content.get("title"):
-                    existing.add(content["title"].lower()[:60])
-    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
-        pass
+        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+            break
+
+        items_data = data.get("data", {}).get("user", {}).get("projectV2", {}).get("items", {})
+        for node in items_data.get("nodes", []):
+            content = node.get("content")
+            if content and content.get("title"):
+                existing.add(content["title"].lower()[:60])
+
+        page_info = items_data.get("pageInfo", {})
+        if page_info.get("hasNextPage"):
+            cursor = page_info["endCursor"]
+        else:
+            break
 
     claude_bin = shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
 
@@ -569,7 +589,7 @@ QUESTION|repo-name|Question title|The specific question for the product owner
 
 Rules:
 - repo-name must match the EXACT GitHub repo name (e.g. vibecheck-app, runbook, half-bakery, recon-radar, CougarCast, true-or-do, ugv_rpi)
-- Output 15 ISSUES and 3 QUESTIONS
+- Output {max_issues} ISSUES and 3 QUESTIONS
 - Prioritize Tier 1 revenue projects (Runbook/runbook, VibeCheck/vibecheck-app) above all else — fill their backlogs DEEP
 - Then Tier 2 portfolio projects
 - Be specific and granular: one concrete task per issue, not bundles
@@ -630,7 +650,7 @@ Vision document:
                 "status": "Review",
             })
 
-    return issues[:7]
+    return issues[:max_issues]
 
 
 def _scan_quality_gaps(project_dir):
@@ -885,6 +905,7 @@ def _move_issue_to_ready_or_column(issue_url, config, fields_cache, target_optio
     """Move a board issue to a specific column by option ID.
 
     Looks up its item_id on the board and sets Status.
+    Paginates through ALL board items so boards with >100 items are handled.
     """
     owner = config["github_repo"].split("/")[0]
     project_num = config["github_project_number"]
@@ -897,41 +918,55 @@ def _move_issue_to_ready_or_column(issue_url, config, fields_cache, target_optio
     issue_number = parts[-1]
     repo_full = "/".join(parts[-4:-2]) if len(parts) >= 4 else ""
 
-    # Query board for this issue
-    query = f'''query {{
-        user(login: "{owner}") {{
-            projectV2(number: {project_num}) {{
-                items(first: 100) {{
-                    nodes {{
-                        id
-                        content {{
-                            ... on Issue {{
-                                number
-                                repository {{ nameWithOwner }}
+    # Query board for this issue — paginate to handle boards with >100 items
+    item_id = None
+    cursor = None
+    while True:
+        after = f', after: "{cursor}"' if cursor else ""
+        query = f'''query {{
+            user(login: "{owner}") {{
+                projectV2(number: {project_num}) {{
+                    items(first: 100{after}) {{
+                        nodes {{
+                            id
+                            content {{
+                                ... on Issue {{
+                                    number
+                                    repository {{ nameWithOwner }}
+                                }}
                             }}
                         }}
+                        pageInfo {{ hasNextPage endCursor }}
                     }}
                 }}
             }}
-        }}
-    }}'''
+        }}'''
 
-    try:
-        result = subprocess.run(
-            ["gh", "api", "graphql", "-f", f"query={query}"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
+        try:
+            result = subprocess.run(
+                ["gh", "api", "graphql", "-f", f"query={query}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                return
+            data = json.loads(result.stdout)
+        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
             return
-        data = json.loads(result.stdout)
-    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
-        return
 
-    item_id = None
-    for node in data.get("data", {}).get("user", {}).get("projectV2", {}).get("items", {}).get("nodes", []):
-        content = node.get("content")
-        if content and str(content.get("number")) == issue_number:
-            item_id = node["id"]
+        items_data = data.get("data", {}).get("user", {}).get("projectV2", {}).get("items", {})
+        for node in items_data.get("nodes", []):
+            content = node.get("content")
+            if content and str(content.get("number")) == issue_number:
+                item_id = node["id"]
+                break
+
+        if item_id:
+            break
+
+        page_info = items_data.get("pageInfo", {})
+        if page_info.get("hasNextPage"):
+            cursor = page_info["endCursor"]
+        else:
             break
 
     if not item_id:
