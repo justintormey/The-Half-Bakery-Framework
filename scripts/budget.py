@@ -112,10 +112,16 @@ def update_session_stats(state, agent_type, duration_min, output_len):
              budget["sessions_this_window"])
 
 
-def get_budget_summary(state):
-    """Return human-readable budget status for logging."""
+def get_budget_summary(state, config=None):
+    """Return human-readable budget status for logging.
+
+    IMPORTANT: pass `config` so the reported max_concurrent reflects the
+    user's actual budget settings. Calling this with no config silently
+    falls back to hardcoded defaults (aggressive_max=3), which drifts
+    from the dispatcher's real limit and makes debugging confusing.
+    """
     budget = state.get("budget", {})
-    profile = get_budget_profile({})  # default config
+    profile = get_budget_profile(config or {})
     window_sessions = budget.get("sessions_this_window", 0)
     return (
         f"mode={profile['mode']} max_concurrent={profile['max_concurrent']} "
