@@ -4,3 +4,4 @@
 *~
 .env
 .agent/
+__pycache__/
